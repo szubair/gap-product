@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="p-5 mb-4 bg-light rounded-3 text-center">
+    <div class="container-fluid py-5">
+        <h1 class="display-5 fw-bold">Welcome to the Vulnerability GAP Identification System</h1>
+        <p class="col-md-8 fs-4 mx-auto">
+            Use the navigation bar above to upload your **Asset List** and **Vulnerability Scan Reports**.
+            Once data is ingested, you can view the active remediation GAP.
+        </p>
+        <a class="btn btn-primary btn-lg" href="{{ url_for('main.upload_assets') }}" role="button">Start Uploading Assets</a>
+    </div>
+</div>
+{% endblock %}
