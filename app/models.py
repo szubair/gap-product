@@ -1,7 +1,8 @@
 # app/models.py (Updated Asset Model)
 
 from app import mongo
-from mongoengine import Document, StringField, ListField
+from datetime import datetime
+from mongoengine import Document, StringField, DateTimeField, ReferenceField, FloatField
 
 class Asset(Document):
     # Core unique fields for linking
@@ -19,4 +20,23 @@ class Asset(Document):
     app_owner = StringField(max_length=64) # Mapped from 'App - Owner'
     vendor_availability = StringField(max_length=50) # Mapped from 'Vendor Availability'
 
-    # ... (other models like VulnerabilityScan and RemediationRecord remain the same)
+# app/models.py (Updated VulnerabilityScan Model)
+class VulnerabilityScan(Document):
+    # Core linkage
+    asset = ReferenceField('Asset', required=True) # Links to the Asset document
+    scan_date = DateTimeField(default=datetime.utcnow)
+    
+    # Core vulnerability info
+    vulnerability_name = StringField(max_length=256, required=True)
+    severity = StringField(max_length=32) # Mapped from 'Risk'
+    
+    # New fields from the report
+    plugin_id = StringField(max_length=20)
+    cve_id = StringField(max_length=256) # Can store multiple CVEs separated by commas
+    cvss_score = FloatField() # Mapped from 'CVSS v2.0 Base Score'
+    description = StringField() # Mapped from 'Description'
+    solution = StringField() # Mapped from 'Solution'
+    
+    meta = {'collection': 'scans'}
+
+# ... (Asset and RemediationRecord models follow)
