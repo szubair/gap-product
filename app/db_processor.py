@@ -78,3 +78,55 @@ def upload_asset_list(file_path):
             skipped_count += 1
             
     return f"Asset list upload complete. Successfully processed: {inserted_count}, Skipped/Error: {skipped_count}"
+
+# app/db_processor.py (Add this function)
+
+from app.models import Asset, VulnerabilityScan
+# ... (read_uploaded_file function from previous response)
+
+def upload_vulnerability_scan(file_path):
+    """Parses scan report, links to assets, and inserts vulnerability findings."""
+    df = read_uploaded_file(file_path)
+    inserted_count = 0
+    skipped_count = 0
+    
+    # Standardize column names for easy access
+    df.columns = df.columns.str.strip() 
+
+    # 1. Iterate through the scan findings
+    for index, row in df.iterrows():
+        try:
+            # Use the 'Host' column to find the corresponding Asset document
+            asset_ip = str(row['Host']).strip()
+            asset_doc = Asset.objects(ip_address=asset_ip).first()
+
+            if not asset_doc:
+                # Skip if the asset doesn't exist in your inventory
+                print(f"Skipping row {index}: Asset not found for IP: {asset_ip}")
+                skipped_count += 1
+                continue
+                
+            # 2. Prepare the data for insertion
+            scan_data = VulnerabilityScan(
+                asset=asset_doc, # The ReferenceField linking to the Asset
+                vulnerability_name=row['Name'],
+                severity=row['Risk'],
+                plugin_id=str(row['Plugin ID']),
+                cve_id=row['CVE'] if pd.notna(row['CVE']) else None,
+                cvss_score=row['CVSS v2.0 Base Score'] if pd.notna(row['CVSS v2.0 Base Score']) else None,
+                description=row['Description'],
+                solution=row['Solution']
+            )
+            
+            # 3. Save the new scan finding document
+            scan_data.save()
+            inserted_count += 1
+            
+        except KeyError as e:
+            # Handle case where a required column is missing
+            raise Exception(f"Missing required column in scan report: {e}")
+        except Exception as e:
+            print(f"An error occurred on row {index}: {e}")
+            skipped_count += 1
+            
+    return f"Vulnerability scan upload complete. Findings processed: {inserted_count}, Skipped/Error: {skipped_count}"
