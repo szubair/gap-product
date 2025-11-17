@@ -1,8 +1,8 @@
 # app/db_processor.py
 import pandas as pd
 import os
-from app.models import Asset
 from mongoengine.errors import NotUniqueError
+from app.models import Asset, VulnerabilityScan
 
 def read_uploaded_file(file_path):
     """Reads CSV or Excel files into a Pandas DataFrame."""
@@ -80,8 +80,6 @@ def upload_asset_list(file_path):
     return f"Asset list upload complete. Successfully processed: {inserted_count}, Skipped/Error: {skipped_count}"
 
 # app/db_processor.py (Add this function)
-
-from app.models import Asset, VulnerabilityScan
 # ... (read_uploaded_file function from previous response)
 
 def upload_vulnerability_scan(file_path):

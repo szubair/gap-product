@@ -6,5 +6,4 @@ from app import create_app
 app = create_app()
 
 if __name__ == '__main__':
-    # Flask runs on http://127.0.0.1:5000/ by default
-    app.run(debug=True)
+    app.run(debug=True, port=5001)

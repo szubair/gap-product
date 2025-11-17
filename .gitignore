@@ -1,0 +1,12 @@
+# Virtual Environment
+venv/
+
+# Python compiled files
+__pycache__/
+*.pyc
+
+# Flask/OS files
+uploads/
+
+# System/IDE files (if applicable)
+.DS_Store
