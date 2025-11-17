@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-5">
+    <h2>Upload {{ upload_type }}</h2>
+    <hr>
+    
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            {% for category, message in messages %}
+                <div class="alert alert-{{ category }}">{{ message }}</div>
+            {% endfor %}
+        {% endif %}
+    {% endwith %}
+
+    <form method="POST" enctype="multipart/form-data">
+        <div class="mb-3">
+            <label for="file" class="form-label">Select File (.csv, .xlsx, .xls)</label>
+            <input type="file" class="form-control" id="file" name="file" required>
+        </div>
+        <button type="submit" class="btn btn-primary">
+            Upload {{ upload_type }}
+        </button>
+    </form>
+    
+    <p class="mt-4 text-muted">
+        {% if upload_type == 'Asset List' %}
+        **Required Columns for Asset List:** HostName, Private IP (Unique Key), Description, STATUS, Role, ENV, Location, Platform, Infra - Owner, App - Owner, Vendor Availability
+        {% else %}
+        **Required Columns for Scan Report:** Host (IP Address), Name, Risk, CVE, CVSS v2.0 Base Score, Plugin ID, Description, Solution
+        {% endif %}
+    </p>
+</div>
+{% endblock %}
