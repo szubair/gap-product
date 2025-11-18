@@ -1,9 +1,11 @@
+# app/db_processor.py
+
 import pandas as pd
 from mongoengine import Q
+# CRITICAL IMPORT: Need this for handling unique index violations
 from mongoengine.errors import NotUniqueError
 from datetime import datetime
-# CRITICAL IMPORT: Include the new UnknownVulnerabilityScan model
-from app.models import Asset, VulnerabilityScan, RemediationRecord, UnknownAsset, UnknownVulnerabilityScan 
+from app.models import Asset, VulnerabilityScan, RemediationRecord, UnknownAsset 
 import os
 
 # --- Helper function to read uploaded file types ---
@@ -14,10 +16,8 @@ def read_uploaded_file(file_path):
              raise FileNotFoundError(f"File not found at path: {file_path}")
 
         if file_path.lower().endswith('.csv'):
-            # Use 'dtype=str' to prevent pandas from auto-casting IDs/IPs to numbers
-            df = pd.read_csv(file_path, dtype=str)
+            df = pd.read_csv(file_path)
         elif file_path.lower().endswith(('.xlsx', '.xls')):
-            # Using str conversion later for Excel for cleaner handling
             df = pd.read_excel(file_path, sheet_name=0) 
         else:
             raise ValueError("Unsupported file type. Must be CSV or Excel.")
@@ -66,34 +66,40 @@ def update_asset_calculated_fields(asset_doc):
     
     return va_count
 
-# --- Unknown Host/Finding Updater ---
+# --- Unknown Host Updater (Temporary Staging Table) ---
 
-def calculate_unknown_asset_va_count(ip_address):
-    """Calculates the unique finding count for an unknown host."""
-    return UnknownVulnerabilityScan.objects(private_ip=ip_address).count()
+def update_unknown_asset_fields(ip_address, hostname, va_count=1, scan_date=None):
+    """
+    Upserts a host into the UnknownAsset collection and updates its VA count and scan date.
+    """
+    if scan_date is None:
+        scan_date = datetime.utcnow()
+        
+    unknown_asset = UnknownAsset.objects(private_ip=ip_address).first()
 
-def update_unknown_asset_host(ip_address, hostname, scan_date):
-    """
-    Updates the main UnknownAsset host record with the latest calculated VA count and scan date.
-    """
-    va_count = calculate_unknown_asset_va_count(ip_address)
-    
-    # Upsert the UnknownAsset record
-    result = UnknownAsset.objects(private_ip=ip_address).update_one(
-        set__hostname=hostname,
-        set__va_count=va_count,
-        set__last_scan_date=scan_date,
-        upsert=True
-    )
-    # The return value from update_one is complex; we just assume success for now.
-    return va_count
+    if unknown_asset:
+        # Increment the count for this new finding and update the scan date
+        unknown_asset.update(
+            inc__va_count=1, 
+            set__last_scan_date=scan_date,
+            set__hostname=hostname if hostname and hostname != "Unknown Hostname" else unknown_asset.hostname 
+        )
+    else:
+        # Insert new unknown host
+        UnknownAsset(
+            private_ip=ip_address,
+            hostname=hostname if hostname else "Unknown Hostname",
+            va_count=va_count,
+            last_scan_date=scan_date
+        ).save()
+
 
 # --- Asset Ingestion Functions ---
 
 def upload_asset_list(file_path):
     """
     Parses asset report, inserts/updates records, AND REMOVES new assets from 
-    the UnknownAsset staging area AND removes all associated unknown findings.
+    the UnknownAsset staging area.
     """
     df = read_uploaded_file(file_path)
     inserted_count = 0
@@ -117,12 +123,10 @@ def upload_asset_list(file_path):
             asset_ip = str(row[COLUMN_MAP['private_ip']]).strip()
             if not asset_ip: continue
             
-            # --- Cleanup: Remove from UnknownAsset and UnknownVulnerabilityScan staging ---
-            removal_result_host = UnknownAsset.objects(private_ip=asset_ip).delete()
-            if removal_result_host > 0:
-                unknown_removed_count += removal_result_host
-                # Also delete all associated staged findings for this IP
-                UnknownVulnerabilityScan.objects(private_ip=asset_ip).delete()
+            # --- Remove from UnknownAsset staging if IP is now known ---
+            removal_result = UnknownAsset.objects(private_ip=asset_ip).delete()
+            if removal_result > 0:
+                unknown_removed_count += removal_result
             
             # --- Main Asset Upsert Logic ---
             update_fields = {
@@ -154,7 +158,7 @@ def upload_asset_list(file_path):
             print(f"An error occurred on row {index}: {e}")
             
     return (f"Asset upload complete. New: {inserted_count}, Updated: {updated_count}. "
-            f"Hosts promoted from unknown list: {unknown_removed_count}")
+            f"Hosts added from unknown list: {unknown_removed_count}")
 
 # --- Scan Ingestion Functions ---
 
@@ -166,7 +170,7 @@ def upload_vulnerability_scan(file_path):
     df = read_uploaded_file(file_path)
     inserted_count = 0
     duplicate_count = 0
-    unknown_finding_count = 0
+    unknown_count = 0
     
     SCAN_COLUMNS = {
         'host': 'Host', 'name': 'Name', 'risk': 'Risk', 'cve': 'CVE',
@@ -184,81 +188,46 @@ def upload_vulnerability_scan(file_path):
         asset_ip = ""
         try:
             # --- Data Cleaning (CRITICAL FOR DUPLICATE CHECK) ---
+            # Strip all fields used in lookups or stored as strings to remove hidden whitespace
             asset_ip = str(row[SCAN_COLUMNS['host']]).strip()
-            if not asset_ip: continue
-            
             asset_hostname_col = [col for col in df.columns if col.lower() == 'hostname']
             asset_hostname = str(row[asset_hostname_col[0]]).strip() if asset_hostname_col and pd.notna(row[asset_hostname_col[0]]) else "Unknown Hostname"
             
             asset_doc = Asset.objects(private_ip=asset_ip).first()
             
-            # --- ULTRA-ROBUST PLUGIN ID CLEANING ---
-            plugin_id_raw = row[SCAN_COLUMNS['plugin_id']]
-            if pd.isna(plugin_id_raw):
-                continue
-
-            if isinstance(plugin_id_raw, (int, float)):
-                plugin_id_str = str(int(plugin_id_raw)) 
-            else:
-                plugin_id_str = str(plugin_id_raw).strip()
-            # --- END ROBUST CLEANING ---
+            plugin_id_str = str(row[SCAN_COLUMNS['plugin_id']]).strip()
             
-            # Strip other fields for consistent storage
+            # Strip fields for consistent storage
             vuln_name = str(row[SCAN_COLUMNS['name']]).strip()
             vuln_severity = str(row[SCAN_COLUMNS['risk']]).strip()
+            vuln_description = str(row[SCAN_COLUMNS['description']]).strip()
+            vuln_solution = str(row[SCAN_COLUMNS['solution']]).strip()
             
+            # Handle NaN/None for CVE and strip if present
+            vuln_cve = str(row[SCAN_COLUMNS['cve']]).strip() if pd.notna(row[SCAN_COLUMNS['cve']]) else None 
+            
+            # CVSS Score is numeric, no strip needed, but must handle NaN
+            cvss_score = float(row[SCAN_COLUMNS['cvss_score']]) if pd.notna(row[SCAN_COLUMNS['cvss_score']]) else None
+
             # Diagnostic Log: What we are checking
-            print(f"DEBUG CHECKING: IP={asset_ip}, PluginID={plugin_id_str}")
+            print(f"DEBUG CHECKING: IP={asset_ip}, PluginID={plugin_id_str}, CVE={vuln_cve}")
 
             if not asset_doc:
-                # --- ASSET IS UNKNOWN: Store the finding in the staging area ---
-                
-                # 1. Attempt to insert unique finding into UnknownVulnerabilityScan
-                try:
-                    UnknownVulnerabilityScan(
-                        private_ip=asset_ip,
-                        plugin_id=plugin_id_str,
-                        vulnerability_name=vuln_name,
-                        severity=vuln_severity,
-                        scan_date=datetime.utcnow()
-                    ).save()
-                    
-                    # If save is successful, it was a new unique finding
-                    unknown_finding_count += 1
-                    
-                    # 2. Update the parent UnknownAsset host record with the new count
-                    update_unknown_asset_host(asset_ip, asset_hostname, datetime.utcnow())
-                    
-                except NotUniqueError:
-                    # Duplicate finding on an unknown host, skip it, but update the host's last scan date
-                    update_unknown_asset_host(asset_ip, asset_hostname, datetime.utcnow())
-                    duplicate_count += 1
-                    print(f"DEBUG SKIPPED (Unknown): Duplicate finding for IP={asset_ip}, PluginID={plugin_id_str}")
-                    continue
-                
-                except Exception as e:
-                    print(f"Error saving unknown scan finding for {asset_ip}: {e}")
-                    continue
-
-                continue # Continue to next row in the Excel file
+                # --- ASSET IS UNKNOWN: Store it in the staging table ---
+                update_unknown_asset_fields(asset_ip, asset_hostname, scan_date=datetime.utcnow())
+                unknown_count += 1
+                continue
             
-            # --- ASSET IS KNOWN & NOT DUPLICATE: Insert the finding ---
-            
-            # CRITICAL DUPLICATE CHECK (Layer 2 - Python Check)
+            # --- CRITICAL DUPLICATE CHECK (Asset + Plugin ID) ---
+            # We use Plugin ID as the technical fingerprint for the finding.
             existing_scan = VulnerabilityScan.objects(asset=asset_doc, plugin_id=plugin_id_str).first()
             
             if existing_scan:
-                print(f"DEBUG SKIPPED (Known): Duplicate found for IP={asset_ip}, PluginID={plugin_id_str}")
+                print(f"DEBUG SKIPPED: Duplicate found for IP={asset_ip}, PluginID={plugin_id_str}")
                 duplicate_count += 1
                 continue
                 
-            # If we reach here, it's a new unique finding on a known host.
-            
-            vuln_description = str(row[SCAN_COLUMNS['description']]).strip()
-            vuln_solution = str(row[SCAN_COLUMNS['solution']]).strip()
-            vuln_cve = str(row[SCAN_COLUMNS['cve']]).strip() if pd.notna(row[SCAN_COLUMNS['cve']]) else None 
-            cvss_score = float(row[SCAN_COLUMNS['cvss_score']]) if pd.notna(row[SCAN_COLUMNS['cvss_score']]) else None
-
+            # --- ASSET IS KNOWN & NOT DUPLICATE: Insert the finding ---
             scan_data = VulnerabilityScan(
                 asset=asset_doc, vulnerability_name=vuln_name,
                 severity=vuln_severity, plugin_id=plugin_id_str,
@@ -267,14 +236,13 @@ def upload_vulnerability_scan(file_path):
             )
             
             try:
-                # Layer 1 - DB-Level enforcement occurs here
                 scan_data.save()
                 inserted_count += 1
                 
                 # Update the parent Asset's calculated fields ONLY if insertion was successful
                 update_asset_calculated_fields(asset_doc) 
             except NotUniqueError:
-                # Should not be reached if Layer 2 is working, but acts as a fail-safe
+                # This block handles the DB-level constraint, though the explicit check should prevent reaching here
                 print(f"DEBUG DB-ERROR: NotUniqueError hit for IP={asset_ip}, PluginID={plugin_id_str}")
                 duplicate_count += 1
                 continue
@@ -282,10 +250,8 @@ def upload_vulnerability_scan(file_path):
         except Exception as e:
             print(f"An error occurred on row {index} (IP {asset_ip}): {e}")
             
-    # The unknown_finding_count is the total number of unique findings added to the staging area.
-    return (f"Vulnerability scan upload complete. Known Findings added: {inserted_count}, "
-            f"Unknown Findings added: {unknown_finding_count}. "
-            f"Duplicates skipped: {duplicate_count}")
+    return (f"Vulnerability scan upload complete. Findings processed: {inserted_count}, "
+            f"Duplicates skipped: {duplicate_count}, Unknown Hosts tracked: {unknown_count}")
 
 # --- Reporting and Display Functions ---
 
