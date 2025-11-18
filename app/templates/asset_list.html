@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-5">
+    <h2>Asset Inventory</h2>
+    <hr>
+    
+    <p class="lead">
+        Total Assets: <strong>{{ assets | length }}</strong>
+    </p>
+
+    <table class="table table-striped table-hover mt-4">
+        <thead class="table-dark">
+            <tr>
+                <th>Hostname</th>
+                <th>Description</th>
+                <th>Role / Platform</th>
+                <th>Private IP</th>
+                <th>ENV / Location</th>
+                <th class="text-center">VA Count</th>
+                <th>Last Scan Date</th>
+                <th>Last Remediated</th>
+                <th>Feedback</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for asset in assets %}
+            <tr>
+                <td><strong>{{ asset.hostname }}</strong></td>
+                <td>{{ asset.description | truncate(50) }}</td>
+                <td>{{ asset.role }} / {{ asset.platform }}</td>
+                <td>{{ asset.private_ip }}</td>
+                <td>{{ asset.env }} / {{ asset.location }}</td>
+                <td class="text-center">
+                    {% if asset.va_count > 0 %}
+                        <span class="badge bg-danger">{{ asset.va_count }}</span>
+                    {% else %}
+                        <span class="badge bg-success">0</span>
+                    {% endif %}
+                </td>
+                <td>{{ asset.last_scan_date }}</td>
+                <td>{{ asset.last_remediated_date }}</td>
+                <td>
+                    {{ asset.feedback }} 
+                    </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

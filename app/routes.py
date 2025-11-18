@@ -4,6 +4,8 @@ from flask import Blueprint, render_template, request, redirect, url_for, flash
 from werkzeug.utils import secure_filename
 import os
 from app.db_processor import upload_asset_list, upload_vulnerability_scan # Import the core logic
+from app.db_processor import get_asset_list_for_display, get_unknown_hosts_for_display
+
 
 bp = Blueprint('main', __name__)
 
@@ -18,6 +20,18 @@ def allowed_file(filename):
 @bp.route('/')
 def index():
     return render_template('index.html')
+
+@bp.route('/assets')
+def view_assets():
+    asset_data = get_asset_list_for_display()
+
+    return render_template('asset_list.html', assets=asset_data)
+
+@bp.route('/unknown-hosts')
+def view_unknown_hosts():
+    unknown_data = get_unknown_hosts_for_display()
+
+    return render_template('unknown_hosts.html', unknown_assets=unknown_data)
 
 @bp.route('/upload_asset_list', methods=['GET', 'POST'])
 def upload_assets():

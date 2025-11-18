@@ -1,0 +1,47 @@
+<!-- app/templates/unknown_hosts.html -->
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-5">
+    <h2>Unknown Hosts Detected in Scans</h2>
+    <hr>
+    
+    <p class="lead text-danger">
+        These hosts have appeared in scan reports but are missing from the main Asset Inventory. 
+        Total Unknown Hosts: <strong>{{ unknown_assets | length }}</strong>
+    </p>
+
+    <table class="table table-striped table-hover mt-4">
+        <thead class="table-dark">
+            <tr>
+                <th>Private IP</th>
+                <th>Hostname (Scan Reported)</th>
+                <th class="text-center">VA Count</th>
+                <th>Last Scan Date</th>
+                <th>Feedback</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for host in unknown_assets %}
+            <tr>
+                <td><strong>{{ host.private_ip }}</strong></td>
+                <td>{{ host.hostname }}</td>
+                <td class="text-center">
+                    {% if host.va_count > 0 %}
+                        <span class="badge bg-danger">{{ host.va_count }}</span>
+                    {% else %}
+                        <span class="badge bg-warning">0</span>
+                    {% endif %}
+                </td>
+                <td>{{ host.last_scan_date }}</td>
+                <td>{{ host.feedback or 'N/A' }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    <div class="alert alert-info mt-3">
+        <strong>Action Required:</strong> To remove a host from this list, you must add it to the Assets Excel file and re-upload the file.
+    </div>
+</div>
+{% endblock %}
+

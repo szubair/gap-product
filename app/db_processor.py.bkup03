@@ -1,0 +1,324 @@
+# app/db_processor.py
+
+import pandas as pd
+from mongoengine import Q
+from datetime import datetime
+from app.models import Asset, VulnerabilityScan, RemediationRecord
+import os
+
+# Helper function to read uploaded file types
+def read_uploaded_file(file_path):
+    """Reads a CSV or Excel file into a pandas DataFrame."""
+    try:
+        # Check if the file path exists before attempting to read
+        if not os.path.exists(file_path):
+             raise FileNotFoundError(f"File not found at path: {file_path}")
+
+        if file_path.lower().endswith('.csv'):
+            df = pd.read_csv(file_path)
+        elif file_path.lower().endswith(('.xlsx', '.xls')):
+            # Read first sheet for Excel files
+            df = pd.read_excel(file_path, sheet_name=0) 
+        else:
+            raise ValueError("Unsupported file type. Must be CSV or Excel.")
+        
+        # Ensure all column headers are strings and strip whitespace
+        df.columns = df.columns.astype(str).str.strip()
+        return df
+    except Exception as e:
+        # Re-raise with a specific message about file reading
+        raise Exception(f"Error reading file {os.path.basename(file_path)}: {e}")
+
+## --- Asset Calculated Fields Updater ---
+
+def update_asset_calculated_fields(asset_doc):
+    """
+    Recalculates VA count, last scan date, and last remediation date 
+    for a specific Asset document.
+    """
+    
+    # 1. Calculate VA Count (Total UNREMEDIATED findings)
+    
+    # Find IDs of remediated scans for this asset
+    remediated_scan_ids = RemediationRecord.objects(
+        scan__in=VulnerabilityScan.objects(asset=asset_doc)
+    ).distinct('scan')
+    
+    # Count all scans for this asset that are NOT in the remediated list
+    va_count = VulnerabilityScan.objects(
+        Q(asset=asset_doc) & Q(id__nin=remediated_scan_ids)
+    ).count()
+
+    # 2. Find Last Scan Date
+    # Find the most recent scan record for this asset
+    last_scan = VulnerabilityScan.objects(asset=asset_doc).order_by('-scan_date').first()
+    
+    last_scan_date = last_scan.scan_date if last_scan else None
+
+    # 3. Find Last Remediated Date
+    # Find the most recent remediation record for this asset
+    last_remediated = RemediationRecord.objects(
+        scan__in=VulnerabilityScan.objects(asset=asset_doc)
+    ).order_by('-remediation_date').first()
+
+    last_remediated_date = last_remediated.remediation_date if last_remediated else None
+
+    # 4. Update the Asset Document in the database (atomically)
+    asset_doc.update(
+        set__va_count=va_count,
+        set__last_scan_date=last_scan_date,
+        set__last_remediated_date=last_remediated_date,
+        set__last_updated=datetime.utcnow()
+    )
+    
+    return va_count
+
+## --- Asset Ingestion Functions ---
+
+def upload_asset_list(file_path):
+    """
+    Parses asset report and inserts/updates records into the MongoDB Asset collection.
+    Uses the user's defined, cleaner headers.
+    """
+    df = read_uploaded_file(file_path)
+    inserted_count = 0
+    updated_count = 0
+    skipped_count = 0
+    
+    # Define the mapping from the new file columns to the Asset model fields
+    COLUMN_MAP = {
+        'hostname': 'Hostname',              
+        'private_ip': 'Private_IP',          
+        'description': 'Description',
+        'status': 'Status',
+        'role': 'Role',
+        'env': 'ENV',
+        'location': 'Location',
+        'platform': 'Platform',
+        'infra_owner': 'Infra_Owner',        
+        'app_owner': 'App_Owner',            
+        'vendor_availability': 'Vendor_Availability' 
+    }
+
+    # Verify all required columns are present in the dataframe
+    required_cols = list(COLUMN_MAP.values())
+    if not all(col in df.columns for col in required_cols):
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        raise KeyError(f"Missing required column in report: {', '.join(missing_cols)}")
+
+    for index, row in df.iterrows():
+        try:
+            # Use the Private_IP as the unique identifier for update/upsert
+            asset_ip = str(row[COLUMN_MAP['private_ip']]).strip()
+            
+            if not asset_ip:
+                skipped_count += 1
+                continue
+            
+            # Use the correct model field name: private_ip
+            update_fields = {
+                'hostname': row[COLUMN_MAP['hostname']],
+                'description': row[COLUMN_MAP['description']],
+                'status': row[COLUMN_MAP['status']],
+                'role': row[COLUMN_MAP['role']],
+                'env': row[COLUMN_MAP['env']],
+                'location': row[COLUMN_MAP['location']],
+                'platform': row[COLUMN_MAP['platform']],
+                'infra_owner': row[COLUMN_MAP['infra_owner']],
+                'app_owner': row[COLUMN_MAP['app_owner']],
+                'vendor_availability': row[COLUMN_MAP['vendor_availability']],
+            }
+            
+            # Use upsert=True to insert if the IP doesn't exist, or update if it does
+            result = Asset.objects(private_ip=asset_ip).update_one(
+                set__hostname=update_fields['hostname'],
+                set__description=update_fields['description'],
+                set__status=update_fields['status'],
+                set__role=update_fields['role'],
+                set__env=update_fields['env'],
+                set__location=update_fields['location'],
+                set__platform=update_fields['platform'],
+                set__infra_owner=update_fields['infra_owner'],
+                set__app_owner=update_fields['app_owner'],
+                set__vendor_availability=update_fields['vendor_availability'],
+                set__last_updated=datetime.utcnow(),
+                upsert=True
+            )
+            
+            # Check if a new document was created (inserted) or an existing one updated
+            if result.upserted_id:
+                inserted_count += 1
+            elif result.modified_count > 0:
+                updated_count += 1
+            
+        except KeyError as e:
+            raise Exception(f"Missing column or error on row {index}: {e}")
+        except Exception as e:
+            print(f"An error occurred on row {index}: {e}")
+            skipped_count += 1
+            
+    return f"Asset upload complete. New: {inserted_count}, Updated: {updated_count}, Skipped/Error: {skipped_count}"
+
+## --- Scan Ingestion Functions ---
+
+def upload_vulnerability_scan(file_path):
+    """
+    Parses scan report, links to assets, and inserts vulnerability findings.
+    CRITICAL: Updates Asset calculated fields after insertion.
+    """
+    df = read_uploaded_file(file_path)
+    inserted_count = 0
+    skipped_count = 0
+    
+    # Define mapping for the Vulnerability Scan report columns (Example based on common reports)
+    SCAN_COLUMNS = {
+        'host': 'Host',
+        'name': 'Name',
+        'risk': 'Risk',
+        'cve': 'CVE',
+        'cvss_score': 'CVSS v2.0 Base Score',
+        'plugin_id': 'Plugin ID',
+        'description': 'Description',
+        'solution': 'Solution'
+    }
+
+    required_cols = list(SCAN_COLUMNS.values())
+    if not all(col in df.columns for col in required_cols):
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        raise KeyError(f"Missing required column in scan report: {', '.join(missing_cols)}")
+
+
+    for index, row in df.iterrows():
+        try:
+            # 1. Use the 'Host' column (IP) to find the corresponding Asset document
+            asset_ip = str(row[SCAN_COLUMNS['host']]).strip()
+            # Note: We query by private_ip now, which matches the model
+            asset_doc = Asset.objects(private_ip=asset_ip).first()
+
+            if not asset_doc:
+                # Skip if the asset doesn't exist in your inventory
+                skipped_count += 1
+                continue
+                
+            # 2. Prepare the data for insertion
+            cve_id = row[SCAN_COLUMNS['cve']] if pd.notna(row[SCAN_COLUMNS['cve']]) else None
+            cvss_score = float(row[SCAN_COLUMNS['cvss_score']]) if pd.notna(row[SCAN_COLUMNS['cvss_score']]) else None
+
+            scan_data = VulnerabilityScan(
+                asset=asset_doc, # The ReferenceField linking to the Asset
+                vulnerability_name=row[SCAN_COLUMNS['name']],
+                severity=row[SCAN_COLUMNS['risk']],
+                plugin_id=str(row[SCAN_COLUMNS['plugin_id']]),
+                cve_id=cve_id,
+                cvss_score=cvss_score,
+                description=row[SCAN_COLUMNS['description']],
+                solution=row[SCAN_COLUMNS['solution']]
+            )
+            
+            # 3. Save the new scan finding document
+            scan_data.save()
+            inserted_count += 1
+            
+            # 4. CRITICAL: Update the parent Asset with new calculated data
+            update_asset_calculated_fields(asset_doc) 
+            
+        except Exception as e:
+            print(f"An error occurred on row {index} (IP {asset_ip}): {e}")
+            skipped_count += 1
+            
+    return f"Vulnerability scan upload complete. Findings processed: {inserted_count}, Skipped/Error: {skipped_count}"
+
+## --- GAP Reporting and Remediation ---
+
+def get_vulnerability_gap():
+    """
+    Identifies the GAP: all existing vulnerability scans that have NO corresponding
+    remediation record.
+    """
+    
+    # 1. Get the list of scan IDs that HAVE been fixed (Remediated)
+    remediated_scan_ids = RemediationRecord.objects.distinct('scan')
+
+    # 2. Query the VulnerabilityScan collection for documents whose ID is NOT in the remediated list
+    # The id__nin operator means 'ID Not In' the list
+    gap_findings = VulnerabilityScan.objects(id__nin=remediated_scan_ids).order_by('-severity', 'asset.hostname')
+    
+    # 3. Prepare the data for display
+    gap_data = []
+    for finding in gap_findings:
+        # Fetch the linked Asset document to get hostname/IP/owner
+        asset = finding.asset.fetch()
+        
+        gap_data.append({
+            'scan_id': str(finding.id), # MongoDB ObjectIds need to be converted to string for display
+            'hostname': asset.hostname,
+            'ip_address': asset.private_ip,
+            'owner_team': asset.infra_owner or asset.app_owner, # Show relevant owner
+            'vulnerability_name': finding.vulnerability_name,
+            'severity': finding.severity,
+            'cvss_score': finding.cvss_score,
+            'scan_date': finding.scan_date.strftime('%Y-%m-%d'),
+        })
+        
+    return gap_data
+
+
+def get_asset_list_for_display():
+    """Fetches all assets with their calculated fields for the display page."""
+    
+    # Fetch all assets, ordered by hostname
+    asset_docs = Asset.objects.order_by('hostname')
+    asset_data = []
+    
+    for asset in asset_docs:
+        # Check if calculated fields need to be updated (e.g., if a manual change occurred)
+        # Note: In a real app, this should be done by triggers, but here we keep it simple.
+        # We assume the update is done during scan/remediation uploads.
+        
+        asset_data.append({
+            'asset_id': str(asset.id),
+            'hostname': asset.hostname,
+            'description': asset.description,
+            'role': asset.role,
+            'private_ip': asset.private_ip,
+            'env': asset.env,
+            'location': asset.location,
+            'platform': asset.platform,
+            'va_count': asset.va_count,
+            'last_scan_date': asset.last_scan_date.strftime('%Y-%m-%d') if asset.last_scan_date else 'N/A',
+            'last_remediated_date': asset.last_remediated_date.strftime('%Y-%m-%d') if asset.last_remediated_date else 'N/A',
+            'feedback': asset.feedback or 'Click to add feedback',
+        })
+        
+    return asset_data
+
+
+def create_remediation_record(scan_object_id, action, status):
+    """
+    Creates a new RemediationRecord, removing the linked VulnerabilityScan from the GAP report.
+    CRITICAL: Also triggers the asset field update.
+    """
+    
+    scan_doc = VulnerabilityScan.objects(id=scan_object_id).first()
+    
+    if not scan_doc:
+        raise ValueError(f"Scan ID {scan_object_id} not found.")
+
+    # Check if it's already remediated (prevent duplicates)
+    if RemediationRecord.objects(scan=scan_doc).first():
+        return True 
+        
+    # 1. Create and save the RemediationRecord
+    remediation = RemediationRecord(
+        scan=scan_doc, 
+        action_taken=action,
+        verified_status=status
+    )
+    remediation.save()
+    
+    # 2. CRITICAL: Update the asset's calculated fields (VA count and last remediated date)
+    asset_doc = scan_doc.asset.fetch()
+    if asset_doc:
+        update_asset_calculated_fields(asset_doc)
+    
+    return True

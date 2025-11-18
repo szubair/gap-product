@@ -1,42 +1,74 @@
-# app/models.py (Updated Asset Model)
-
-from app import mongo
+from flask_mongoengine import MongoEngine
+from mongoengine import Document, StringField, IntField, FloatField, DateTimeField, ReferenceField
 from datetime import datetime
-from mongoengine import Document, StringField, DateTimeField, ReferenceField, FloatField
+
+db = MongoEngine()
 
 class Asset(Document):
-    # Core unique fields for linking
-    hostname = StringField(max_length=120, required=True)
-    ip_address = StringField(max_length=15, unique=True, required=True) # Mapped from 'Private IP'
+    """
+    Represents an asset in the inventory.
+    Updated to include calculated fields for reporting.
+    """
+    # Core Asset Data (from assets file)
+    hostname = StringField(required=True)
+    private_ip = StringField(required=True, unique=True)
+    description = StringField()
+    status = StringField()
+    role = StringField()
+    env = StringField()
+    location = StringField()
+    platform = StringField()
+    infra_owner = StringField()
+    app_owner = StringField()
+    vendor_availability = StringField()
+    
+    # --- CALCULATED FIELDS FOR DISPLAY ---
+    # VA Count: Total current vulnerabilities (not remediated)
+    va_count = IntField(default=0)
+    
+    # Last Scan Date: Date of the most recent vulnerability scan finding for this asset
+    last_scan_date = DateTimeField(default=None)
+    
+    # Last Remediated Date: Date of the most recent remediation record for this asset
+    last_remediated_date = DateTimeField(default=None)
+    
+    # Feedback: User-added note from the portal
+    feedback = StringField(default=None)
+    
+    # Metadata
+    last_updated = DateTimeField(default=datetime.utcnow)
+    
+    meta = {'collection': 'assets'} 
 
-    # Descriptive and ownership fields
-    description = StringField(max_length=256)
-    status = StringField(max_length=50) # Mapped from 'STATUS'
-    role = StringField(max_length=50)
-    env = StringField(max_length=50) # Mapped from 'ENV'
-    location = StringField(max_length=50)
-    platform = StringField(max_length=50)
-    infra_owner = StringField(max_length=64) # Mapped from 'Infra - Owner'
-    app_owner = StringField(max_length=64) # Mapped from 'App - Owner'
-    vendor_availability = StringField(max_length=50) # Mapped from 'Vendor Availability'
-
-# app/models.py (Updated VulnerabilityScan Model)
 class VulnerabilityScan(Document):
-    # Core linkage
-    asset = ReferenceField('Asset', required=True) # Links to the Asset document
+    """
+    Represents a specific vulnerability finding from a scan report.
+    It links back to the Asset that owns the vulnerability.
+    """
+    asset = ReferenceField(Asset, reverse_delete_rule=2, required=True) # 2=CASCADE
+    
+    # Scan Finding Details
+    vulnerability_name = StringField(required=True)
+    severity = StringField()
+    plugin_id = StringField()
+    cve_id = StringField()
+    cvss_score = FloatField()
+    description = StringField()
+    solution = StringField()
+    
+    # Metadata
     scan_date = DateTimeField(default=datetime.utcnow)
     
-    # Core vulnerability info
-    vulnerability_name = StringField(max_length=256, required=True)
-    severity = StringField(max_length=32) # Mapped from 'Risk'
-    
-    # New fields from the report
-    plugin_id = StringField(max_length=20)
-    cve_id = StringField(max_length=256) # Can store multiple CVEs separated by commas
-    cvss_score = FloatField() # Mapped from 'CVSS v2.0 Base Score'
-    description = StringField() # Mapped from 'Description'
-    solution = StringField() # Mapped from 'Solution'
-    
-    meta = {'collection': 'scans'}
+    meta = {'collection': 'vulnerability_scans'}
 
-# ... (Asset and RemediationRecord models follow)
+class RemediationRecord(Document):
+    """
+    Tracks that a specific vulnerability (VulnerabilityScan) has been remediated.
+    This removes the finding from the active GAP report.
+    """
+    scan = ReferenceField(VulnerabilityScan, reverse_delete_rule=2, required=True, unique=True)
+    action_taken = StringField(required=True)
+    verified_status = StringField(required=True) # e.g., 'Fixed', 'Accepted Risk'
+    remediation_date = DateTimeField(default=datetime.utcnow)
+    
+    meta = {'collection': 'remediation_records'}
