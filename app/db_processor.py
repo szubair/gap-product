@@ -1,393 +1,322 @@
-import pandas as pd
-from mongoengine import Q
-from mongoengine.errors import NotUniqueError
 from datetime import datetime
-# CRITICAL IMPORT: Include the new UnknownVulnerabilityScan model
-from app.models import Asset, VulnerabilityScan, RemediationRecord, UnknownAsset, UnknownVulnerabilityScan 
-import os
+import pandas as pd
+from mongoengine.errors import NotUniqueError
+from app.models import Asset, VulnerabilityScan, RemediationRecord, UnknownAsset, UnknownVulnerabilityScan # Import all models
 
-# --- Helper function to read uploaded file types ---
-def read_uploaded_file(file_path):
-    """Reads a CSV or Excel file into a pandas DataFrame."""
-    try:
-        if not os.path.exists(file_path):
-             raise FileNotFoundError(f"File not found at path: {file_path}")
-
-        if file_path.lower().endswith('.csv'):
-            # Use 'dtype=str' to prevent pandas from auto-casting IDs/IPs to numbers
-            df = pd.read_csv(file_path, dtype=str)
-        elif file_path.lower().endswith(('.xlsx', '.xls')):
-            # Using str conversion later for Excel for cleaner handling
-            df = pd.read_excel(file_path, sheet_name=0) 
-        else:
-            raise ValueError("Unsupported file type. Must be CSV or Excel.")
-        
-        df.columns = df.columns.astype(str).str.strip()
-        return df
-    except Exception as e:
-        raise Exception(f"Error reading file {os.path.basename(file_path)}: {e}")
-
-# --- Asset Calculated Fields Updater (Main Asset Table) ---
-
-def update_asset_calculated_fields(asset_doc):
+# --- Helper Function for VA Count Calculation ---
+def update_asset_calculated_fields(asset_doc: Asset):
     """
-    Recalculates VA count, last scan date, and last remediation date 
-    for a specific Asset document.
+    Calculates the current VA count, last scan date, and last remediated date 
+    for a given Asset based on linked VulnerabilityScan and RemediationRecord data.
     """
     
-    # 1. Calculate VA Count (Total UNREMEDIATED findings)
-    # Get the IDs of all scan findings that have a remediation record
-    remediated_scan_ids = RemediationRecord.objects(
-        scan__in=VulnerabilityScan.objects(asset=asset_doc)
-    ).distinct('scan')
+    # 1. Find all scans for this asset that have a remediation record
+    # We collect the IDs of the scans that are remediated
+    remediated_scan_ids = [
+        rr.scan.id for rr in RemediationRecord.objects(scan__in=VulnerabilityScan.objects(asset=asset_doc))
+    ]
     
-    # Count all vulnerability scans linked to this asset, excluding those that are remediated
-    va_count = VulnerabilityScan.objects(
-        Q(asset=asset_doc) & Q(id__nin=remediated_scan_ids)
-    ).count()
+    # 2. Find all scans that are NOT remediated (i.e., open findings)
+    # Exclude scans where the ID is in the remediated_scan_ids list
+    open_scans = VulnerabilityScan.objects(asset=asset_doc).filter(id__nin=remediated_scan_ids)
+    
+    # 3. Calculate VA Count (Number of open, unique findings)
+    va_count = open_scans.count()
+    
+    # DEBUG VA COUNT: Check the number calculated
+    print(f"DEBUG VA COUNT for IP {asset_doc.private_ip}: {va_count} open findings.")
 
-    # 2. Find Last Scan Date
+    # 4. Determine Last Scan Date
     last_scan = VulnerabilityScan.objects(asset=asset_doc).order_by('-scan_date').first()
     last_scan_date = last_scan.scan_date if last_scan else None
 
-    # 3. Find Last Remediated Date
-    last_remediated = RemediationRecord.objects(
-        scan__in=VulnerabilityScan.objects(asset=asset_doc)
-    ).order_by('-remediation_date').first()
-    last_remediated_date = last_remediated.remediation_date if last_remediated else None
+    # 5. Determine Last Remediated Date
+    last_remediation = RemediationRecord.objects(scan__in=VulnerabilityScan.objects(asset=asset_doc)).order_by('-remediation_date').first()
+    last_remediated_date = last_remediation.remediation_date if last_remediation else None
 
-    # 4. Update the Asset Document
+    # 6. Update the Asset Document
     asset_doc.update(
         set__va_count=va_count,
         set__last_scan_date=last_scan_date,
         set__last_remediated_date=last_remediated_date,
         set__last_updated=datetime.utcnow()
     )
-    
-    return va_count
 
-# --- Unknown Host/Finding Updater ---
-
-def calculate_unknown_asset_va_count(ip_address):
-    """Calculates the unique finding count for an unknown host."""
-    return UnknownVulnerabilityScan.objects(private_ip=ip_address).count()
-
-def update_unknown_asset_host(ip_address, hostname, scan_date):
+# --- NEW HELPER: Migrate Findings on Promotion ---
+def migrate_unknown_findings_to_asset(asset_doc: Asset):
     """
-    Updates the main UnknownAsset host record with the latest calculated VA count and scan date.
+    MIGRATION FIX: Moves findings from UnknownVulnerabilityScan to VulnerabilityScan 
+    when the UnknownAsset is promoted to a formal Asset.
     """
-    va_count = calculate_unknown_asset_va_count(ip_address)
     
-    # Upsert the UnknownAsset record
-    result = UnknownAsset.objects(private_ip=ip_address).update_one(
-        set__hostname=hostname,
-        set__va_count=va_count,
-        set__last_scan_date=scan_date,
-        upsert=True
-    )
-    # The return value from update_one is complex; we just assume success for now.
-    return va_count
+    ip_address = asset_doc.private_ip
+    
+    # 1. Find all unknown findings for this IP
+    unknown_findings = UnknownVulnerabilityScan.objects(private_ip=ip_address)
+    
+    # 2. Loop through and create formal VulnerabilityScan records
+    for uf in unknown_findings:
+        try:
+            VulnerabilityScan(
+                asset=asset_doc, # Link to the new Asset document
+                plugin_id=uf.plugin_id,
+                vulnerability_name=uf.vulnerability_name,
+                severity=uf.severity,
+                scan_date=uf.scan_date
+                # Note: cve_id, cvss_score, description, solution are not in the UnknownVulnerabilityScan model
+            ).save()
+        except NotUniqueError:
+            # This should not happen if the UnknownVulnerabilityScan was unique, 
+            # but we catch it just in case of race conditions.
+            print(f"DEBUG: Skipped duplicate finding during migration for IP {ip_address}, Plugin {uf.plugin_id}")
+            pass
+        except Exception as e:
+            print(f"ERROR migrating unknown finding: {e}")
+            pass
 
-# --- Asset Ingestion Functions ---
+    # 3. Clean up staging tables after successful migration
+    UnknownVulnerabilityScan.objects(private_ip=ip_address).delete()
+    UnknownAsset.objects(private_ip=ip_address).delete()
+
+    print(f"DEBUG MIGRATION: {unknown_findings.count()} findings migrated and staging records cleaned for IP {ip_address}")
+
+
+# --- Main Ingestion Functions ---
 
 def upload_asset_list(file_path):
     """
-    Parses asset report, inserts/updates records, AND REMOVES new assets from 
-    the UnknownAsset staging area AND removes all associated unknown findings.
+    Uploads asset inventory data from an Excel file, using private_ip for upserting.
+    Also handles promotion of unknown hosts into the Asset table.
     """
-    df = read_uploaded_file(file_path)
-    inserted_count = 0
-    updated_count = 0
-    unknown_removed_count = 0
-    
-    COLUMN_MAP = {
-        'hostname': 'Hostname', 'private_ip': 'Private_IP', 'description': 'Description',
-        'status': 'Status', 'role': 'Role', 'env': 'ENV', 'location': 'Location',
-        'platform': 'Platform', 'infra_owner': 'Infra_Owner', 'app_owner': 'App_Owner',
-        'vendor_availability': 'Vendor_Availability'
-    }
+    try:
+        df = pd.read_excel(file_path).fillna('')
+        inserted_count = 0
+        updated_count = 0
+        
+        # Track IPs that were promoted/updated to clean up staging tables later
+        promoted_ips = []
 
-    required_cols = list(COLUMN_MAP.values())
-    if not all(col in df.columns for col in required_cols):
-        missing_cols = [col for col in required_cols if col not in df.columns]
-        raise KeyError(f"Missing required column in report: {', '.join(missing_cols)}")
+        for index, row in df.iterrows():
+            asset_ip = str(row['private_ip']).strip()
+            asset_hostname = str(row['hostname']).strip()
+            
+            if not asset_ip:
+                print(f"Skipping row {index}: private_ip is missing.")
+                continue
 
-    for index, row in df.iterrows():
-        try:
-            asset_ip = str(row[COLUMN_MAP['private_ip']]).strip()
-            if not asset_ip: continue
-            
-            # --- Cleanup: Remove from UnknownAsset and UnknownVulnerabilityScan staging ---
-            removal_result_host = UnknownAsset.objects(private_ip=asset_ip).delete()
-            if removal_result_host > 0:
-                unknown_removed_count += removal_result_host
-                # Also delete all associated staged findings for this IP
-                UnknownVulnerabilityScan.objects(private_ip=asset_ip).delete()
-            
-            # --- Main Asset Upsert Logic ---
-            update_fields = {
-                'hostname': row[COLUMN_MAP['hostname']], 'description': row[COLUMN_MAP['description']],
-                'status': row[COLUMN_MAP['status']], 'role': row[COLUMN_MAP['role']],
-                'env': row[COLUMN_MAP['env']], 'location': row[COLUMN_MAP['location']],
-                'platform': row[COLUMN_MAP['platform']], 'infra_owner': row[COLUMN_MAP['infra_owner']],
-                'app_owner': row[COLUMN_MAP['app_owner']], 'vendor_availability': row[COLUMN_MAP['vendor_availability']],
-            }
-            
+            # Upsert the Asset document
             result = Asset.objects(private_ip=asset_ip).update_one(
-                set__hostname=update_fields['hostname'], set__description=update_fields['description'],
-                set__status=update_fields['status'], set__role=update_fields['role'],
-                set__env=update_fields['env'], set__location=update_fields['location'],
-                set__platform=update_fields['platform'], set__infra_owner=update_fields['infra_owner'],
-                set__app_owner=update_fields['app_owner'], set__vendor_availability=update_fields['vendor_availability'],
+                set__hostname=asset_hostname,
+                set__description=row['description'],
+                set__status=row['status'],
+                set__role=row['role'],
+                set__env=row['env'],
+                set__location=row['location'],
+                set__platform=row['platform'],
+                set__infra_owner=row['infra_owner'],
+                set__app_owner=row['app_owner'],
+                set__vendor_availability=row['vendor_availability'],
                 set__last_updated=datetime.utcnow(),
                 upsert=True
             )
-            
-            if result.upserted_id:
-                inserted_count += 1
-            elif result.modified_count > 0:
-                updated_count += 1
-            
-        except KeyError as e:
-            raise Exception(f"Missing column or error on row {index}: {e}")
-        except Exception as e:
-            print(f"An error occurred on row {index}: {e}")
-            
-    return (f"Asset upload complete. New: {inserted_count}, Updated: {updated_count}. "
-            f"Hosts promoted from unknown list: {unknown_removed_count}")
 
-# --- Scan Ingestion Functions ---
+            # Robust Check for inserted/updated count
+            is_new_insert = False
+            
+            if hasattr(result, 'raw_result') and result.raw_result.get('upserted'):
+                inserted_count += 1
+                is_new_insert = True
+            elif hasattr(result, 'modified_count') and result.modified_count > 0:
+                updated_count += 1
+            elif isinstance(result, int) and result > 0:
+                updated_count += 1
+
+            # --- CRITICAL FIX: Asset Promotion and VA Count Calculation ---
+            if is_new_insert or updated_count > 0:
+                # Fetch the newly created/updated Asset document
+                asset_doc = Asset.objects(private_ip=asset_ip).first()
+                if asset_doc:
+                    # 1. Migrate any staged findings from the unknown collection
+                    migrate_unknown_findings_to_asset(asset_doc)
+                    
+                    # 2. Update the VA count immediately after migration
+                    update_asset_calculated_fields(asset_doc)
+                    
+                    promoted_ips.append(asset_ip) # Track for final cleanup if needed
+                    
+        return f"Asset list upload complete. Inserted: {inserted_count}, Updated: {updated_count}. Promoted/Processed: {len(promoted_ips)} hosts."
+
+    except Exception as e:
+        return f"An error occurred during asset list upload: {e}"
+
 
 def upload_vulnerability_scan(file_path):
     """
-    Parses scan report, links to assets, or stores as UnknownAsset if not found.
-    Uses an explicit check and NotUniqueError handling to prevent duplicates.
+    Uploads vulnerability scan data. Links findings to Assets or stages them as UnknownAssets.
     """
-    df = read_uploaded_file(file_path)
-    inserted_count = 0
-    duplicate_count = 0
-    unknown_finding_count = 0
-    
-    SCAN_COLUMNS = {
-        'host': 'Host', 'name': 'Name', 'risk': 'Risk', 'cve': 'CVE',
-        'cvss_score': 'CVSS v2.0 Base Score', 'plugin_id': 'Plugin ID',
-        'description': 'Description', 'solution': 'Solution'
-    }
+    try:
+        df = pd.read_excel(file_path).fillna('')
+        inserted_count = 0
+        updated_count = 0
+        duplicate_count = 0
+        unknown_count = 0
+        
+        # Set scan date once for the entire batch
+        scan_date = datetime.utcnow()
 
-    required_cols = list(SCAN_COLUMNS.values())
-    if not all(col in df.columns for col in required_cols):
-        missing_cols = [col for col in required_cols if col not in df.columns]
-        raise KeyError(f"Missing required column in scan report: {', '.join(missing_cols)}")
-
-
-    for index, row in df.iterrows():
-        asset_ip = ""
-        try:
-            # --- Data Cleaning (CRITICAL FOR DUPLICATE CHECK) ---
-            asset_ip = str(row[SCAN_COLUMNS['host']]).strip()
-            if not asset_ip: continue
+        for index, row in df.iterrows():
+            asset_ip_raw = row['private_ip']
+            plugin_id_raw = row['plugin_id']
             
-            asset_hostname_col = [col for col in df.columns if col.lower() == 'hostname']
-            asset_hostname = str(row[asset_hostname_col[0]]).strip() if asset_hostname_col and pd.notna(row[asset_hostname_col[0]]) else "Unknown Hostname"
-            
-            asset_doc = Asset.objects(private_ip=asset_ip).first()
-            
-            # --- ULTRA-ROBUST PLUGIN ID CLEANING ---
-            plugin_id_raw = row[SCAN_COLUMNS['plugin_id']]
-            if pd.isna(plugin_id_raw):
+            if not asset_ip_raw or not plugin_id_raw:
+                print(f"Skipping row {index}: Missing IP or Plugin ID.")
                 continue
 
+            # --- ULTRA-ROBUST CLEANING AND DATA CONVERSION ---
+            # Ensure IP is a clean string
+            asset_ip = str(asset_ip_raw).strip()
+            # Ensure Plugin ID is a consistent integer string (handling 90001 vs 90001.0)
             if isinstance(plugin_id_raw, (int, float)):
-                plugin_id_str = str(int(plugin_id_raw)) 
+                plugin_id_str = str(int(plugin_id_raw))
             else:
                 plugin_id_str = str(plugin_id_raw).strip()
-            # --- END ROBUST CLEANING ---
-            
-            # Strip other fields for consistent storage
-            vuln_name = str(row[SCAN_COLUMNS['name']]).strip()
-            vuln_severity = str(row[SCAN_COLUMNS['risk']]).strip()
-            
-            # Diagnostic Log: What we are checking
-            print(f"DEBUG CHECKING: IP={asset_ip}, PluginID={plugin_id_str}")
 
+            asset_hostname = str(row['hostname']).strip()
+            
+            # 1. Try to find the host in the main Asset inventory
+            asset_doc = Asset.objects(private_ip=asset_ip).first()
+            
+            # --- HOST IS UNKNOWN (Staging Logic) ---
             if not asset_doc:
-                # --- ASSET IS UNKNOWN: Store the finding in the staging area ---
+                # 1. Ensure the UnknownHost itself exists/is updated
+                unknown_host_doc = UnknownAsset.objects(private_ip=asset_ip).first()
+                if not unknown_host_doc:
+                    # Insert new unknown host placeholder
+                    UnknownAsset(
+                        private_ip=asset_ip,
+                        hostname=asset_hostname,
+                        va_count=0, # Count is calculated from UnknownVulnerabilityScan
+                        last_scan_date=scan_date
+                    ).save()
+                    unknown_host_doc = UnknownAsset.objects(private_ip=asset_ip).first() # Fetch for ID/Ref
+                    
+                else:
+                    # Host exists, update scan date
+                    unknown_host_doc.update(
+                        set__last_scan_date=scan_date
+                    )
                 
-                # 1. Attempt to insert unique finding into UnknownVulnerabilityScan
+                # 2. Insert/Upsert the finding into the UnknownVulnerabilityScan staging table
                 try:
+                    # We only need the key fields to maintain a count
                     UnknownVulnerabilityScan(
                         private_ip=asset_ip,
                         plugin_id=plugin_id_str,
-                        vulnerability_name=vuln_name,
-                        severity=vuln_severity,
-                        scan_date=datetime.utcnow()
+                        vulnerability_name=row['vulnerability_name'],
+                        severity=row['severity'],
+                        scan_date=scan_date
                     ).save()
                     
-                    # If save is successful, it was a new unique finding
-                    unknown_finding_count += 1
+                    # 3. Recalculate VA count for the UnknownAsset host placeholder
+                    # Count distinct plugin IDs in the staging table for this IP
+                    new_va_count = UnknownVulnerabilityScan.objects(private_ip=asset_ip).distinct('plugin_id').count()
+                    unknown_host_doc.update(set__va_count=new_va_count)
                     
-                    # 2. Update the parent UnknownAsset host record with the new count
-                    update_unknown_asset_host(asset_ip, asset_hostname, datetime.utcnow())
-                    
+                    unknown_count += 1
                 except NotUniqueError:
-                    # Duplicate finding on an unknown host, skip it, but update the host's last scan date
-                    update_unknown_asset_host(asset_ip, asset_hostname, datetime.utcnow())
+                    # Finding already exists in staging table, silently skip
                     duplicate_count += 1
-                    print(f"DEBUG SKIPPED (Unknown): Duplicate finding for IP={asset_ip}, PluginID={plugin_id_str}")
-                    continue
-                
                 except Exception as e:
-                    print(f"Error saving unknown scan finding for {asset_ip}: {e}")
-                    continue
+                    print(f"DEBUG DB-ERROR on row {index} (Unknown Host): {e}")
 
-                continue # Continue to next row in the Excel file
-            
-            # --- ASSET IS KNOWN & NOT DUPLICATE: Insert the finding ---
-            
-            # CRITICAL DUPLICATE CHECK (Layer 2 - Python Check)
-            existing_scan = VulnerabilityScan.objects(asset=asset_doc, plugin_id=plugin_id_str).first()
-            
-            if existing_scan:
-                print(f"DEBUG SKIPPED (Known): Duplicate found for IP={asset_ip}, PluginID={plugin_id_str}")
-                duplicate_count += 1
-                continue
+                continue # Move to next row
                 
-            # If we reach here, it's a new unique finding on a known host.
+            # --- HOST IS KNOWN (Main VulnerabilityScan Logic) ---
             
-            vuln_description = str(row[SCAN_COLUMNS['description']]).strip()
-            vuln_solution = str(row[SCAN_COLUMNS['solution']]).strip()
-            vuln_cve = str(row[SCAN_COLUMNS['cve']]).strip() if pd.notna(row[SCAN_COLUMNS['cve']]) else None 
-            cvss_score = float(row[SCAN_COLUMNS['cvss_score']]) if pd.notna(row[SCAN_COLUMNS['cvss_score']]) else None
+            # Get other fields
+            vulnerability_name = str(row['vulnerability_name']).strip()
+            severity = str(row['severity']).strip()
+            
+            # CRITICAL DUPLICATE CHECK: Explicitly check for existence before saving
+            print(f"DEBUG CHECKING: IP={asset_ip}, Plugin={plugin_id_str}")
+            if VulnerabilityScan.objects(asset=asset_doc, plugin_id=plugin_id_str).first():
+                duplicate_count += 1
+                print(f"DEBUG SKIPPED: Duplicate found for IP={asset_ip}, Plugin={plugin_id_str}")
+                continue
 
-            scan_data = VulnerabilityScan(
-                asset=asset_doc, vulnerability_name=vuln_name,
-                severity=vuln_severity, plugin_id=plugin_id_str,
-                cve_id=vuln_cve, cvss_score=cvss_score, 
-                description=vuln_description, solution=vuln_solution
-            )
-            
+            # Attempt to insert the unique finding
             try:
-                # Layer 1 - DB-Level enforcement occurs here
-                scan_data.save()
+                VulnerabilityScan(
+                    asset=asset_doc,
+                    plugin_id=plugin_id_str,
+                    vulnerability_name=vulnerability_name,
+                    severity=severity,
+                    cve_id=row['cve_id'],
+                    cvss_score=row['cvss_score'],
+                    description=row['description'],
+                    solution=row['solution'],
+                    scan_date=scan_date
+                ).save()
                 inserted_count += 1
                 
-                # Update the parent Asset's calculated fields ONLY if insertion was successful
-                update_asset_calculated_fields(asset_doc) 
+                # Call helper to update calculated fields for the asset immediately after successful insert
+                update_asset_calculated_fields(asset_doc)
+
             except NotUniqueError:
-                # Should not be reached if Layer 2 is working, but acts as a fail-safe
-                print(f"DEBUG DB-ERROR: NotUniqueError hit for IP={asset_ip}, PluginID={plugin_id_str}")
+                # Fallback check: If the explicit check failed (e.g., race condition), MongoDB catches it
                 duplicate_count += 1
-                continue
-            
-        except Exception as e:
-            print(f"An error occurred on row {index} (IP {asset_ip}): {e}")
-            
-    # The unknown_finding_count is the total number of unique findings added to the staging area.
-    return (f"Vulnerability scan upload complete. Known Findings added: {inserted_count}, "
-            f"Unknown Findings added: {unknown_finding_count}. "
-            f"Duplicates skipped: {duplicate_count}")
+                print(f"DEBUG DB-ERROR on row {index}: NotUniqueError caught (fallback).")
+            except Exception as e:
+                print(f"An error occurred on row {index}: {e}")
 
-# --- Reporting and Display Functions ---
+        return f"Vulnerability scan upload complete. Known Findings Inserted: {inserted_count}, Unknown Findings Staged: {unknown_count}, Duplicates Skipped: {duplicate_count}."
 
+    except Exception as e:
+        return f"An error occurred during scan upload: {e}"
+
+
+# --- NEW: Function to get all known assets for display ---
 def get_asset_list_for_display():
-    """Fetches all known assets with their calculated fields for the display page."""
-    
-    asset_docs = Asset.objects.order_by('hostname')
-    asset_data = []
-    
-    for asset in asset_docs:
+    """Fetches all known assets for the main inventory display."""
+    try:
+        # Fetch assets, sorted by private_ip for consistency
+        assets = Asset.objects().order_by('private_ip')
         
-        asset_data.append({
-            'asset_id': str(asset.id),
-            'hostname': asset.hostname,
-            'description': asset.description,
-            'role': asset.role,
-            'private_ip': asset.private_ip,
-            'env': asset.env,
-            'location': asset.location,
-            'platform': asset.platform,
-            'va_count': asset.va_count,
-            'last_scan_date': asset.last_scan_date.strftime('%Y-%m-%d') if asset.last_scan_date else 'N/A',
-            'last_remediated_date': asset.last_remediated_date.strftime('%Y-%m-%d') if asset.last_remediated_date else 'N/A',
-            'feedback': asset.feedback or 'Click to add feedback',
-        })
-        
-    return asset_data
+        return [{
+            'id': str(a.id),
+            'private_ip': a.private_ip,
+            'hostname': a.hostname,
+            'va_count': a.va_count,
+            'status': a.status,
+            'role': a.role,
+            'env': a.env,
+            'location': a.location,
+            'platform': a.platform,
+            'infra_owner': a.infra_owner,
+            'app_owner': a.app_owner,
+            'last_scan_date': a.last_scan_date.strftime('%Y-%m-%d %H:%M:%S') if a.last_scan_date else 'N/A',
+            'last_updated': a.last_updated.strftime('%Y-%m-%d %H:%M:%S') if a.last_updated else 'N/A',
+        } for a in assets]
+    except Exception as e:
+        print(f"Error fetching asset list: {e}")
+        return []
+
 
 def get_unknown_hosts_for_display():
-    """Fetches all unknown assets for the new display page."""
-    
-    unknown_docs = UnknownAsset.objects.order_by('-va_count') # Order by highest risk
-    unknown_data = []
-    
-    for host in unknown_docs:
-        unknown_data.append({
-            'private_ip': host.private_ip,
-            'hostname': host.hostname,
-            'va_count': host.va_count,
-            'last_scan_date': host.last_scan_date.strftime('%Y-%m-%d %H:%M') if host.last_scan_date else 'N/A',
-            'feedback': host.feedback or 'N/A',
-            'host_id': str(host.id)
-        })
+    """Fetches all unknown hosts and their finding counts for reporting."""
+    try:
+        hosts = UnknownAsset.objects().order_by('-last_scan_date')
         
-    return unknown_data
+        # We don't need to manually calculate the VA count here as it's updated 
+        # when the UnknownVulnerabilityScan collection is populated.
 
-def get_vulnerability_gap():
-    """
-    Identifies the GAP: all existing vulnerability scans that have NO corresponding
-    remediation record.
-    """
-    
-    remediated_scan_ids = RemediationRecord.objects.distinct('scan')
-
-    gap_findings = VulnerabilityScan.objects(id__nin=remediated_scan_ids).order_by('-severity', 'asset.hostname')
-    
-    gap_data = []
-    for finding in gap_findings:
-        try:
-            asset = finding.asset.fetch()
-        except Exception:
-            continue 
-            
-        gap_data.append({
-            'scan_id': str(finding.id), 
-            'hostname': asset.hostname,
-            'ip_address': asset.private_ip,
-            'owner_team': asset.infra_owner or asset.app_owner, 
-            'vulnerability_name': finding.vulnerability_name,
-            'severity': finding.severity,
-            'cvss_score': finding.cvss_score,
-            'scan_date': finding.scan_date.strftime('%Y-%m-%d'),
-        })
-        
-    return gap_data
-
-
-def create_remediation_record(scan_object_id, action, status):
-    """
-    Creates a new RemediationRecord and updates the associated asset's calculated fields.
-    """
-    
-    scan_doc = VulnerabilityScan.objects(id=scan_object_id).first()
-    
-    if not scan_doc:
-        raise ValueError(f"Scan ID {scan_object_id} not found.")
-
-    # Check if it's already remediated (prevent duplicates)
-    if RemediationRecord.objects(scan=scan_doc).first():
-        return True 
-        
-    # 1. Create and save the RemediationRecord
-    remediation = RemediationRecord(
-        scan=scan_doc, 
-        action_taken=action,
-        verified_status=status
-    )
-    remediation.save()
-    
-    # 2. CRITICAL: Update the asset's calculated fields (VA count and last remediated date)
-    asset_doc = scan_doc.asset.fetch()
-    if asset_doc:
-        update_asset_calculated_fields(asset_doc)
-    
-    return True
+        return [{
+            'private_ip': h.private_ip,
+            'hostname': h.hostname,
+            'va_count': h.va_count,
+            'last_scan_date': h.last_scan_date.strftime('%Y-%m-%d %H:%M:%S') if h.last_scan_date else 'N/A',
+            'feedback': h.feedback
+        } for h in hosts]
+    except Exception as e:
+        print(f"Error fetching unknown hosts: {e}")
+        return []
