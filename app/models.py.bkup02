@@ -1,4 +1,5 @@
 from flask_mongoengine import MongoEngine
+# CRITICAL FIX: Only import classes defined in the mongoengine library.
 from mongoengine import Document, StringField, IntField, FloatField, DateTimeField, ReferenceField
 from datetime import datetime
 
@@ -47,13 +48,7 @@ class VulnerabilityScan(Document):
     # Store the date of the scan event itself
     scan_date = DateTimeField(default=datetime.utcnow) 
 
-    meta = {
-        'collection': 'vulnerability_scans',
-        # CRITICAL FIX: Ensures only one finding per asset and plugin ID exists.
-        'indexes': [
-            {'fields': ('asset', 'plugin_id'), 'unique': True}
-        ]
-    }
+    meta = {'collection': 'vulnerability_scans'}
 
 # --- MODEL 3: Remediation Records ---
 class RemediationRecord(Document):
