@@ -4,7 +4,8 @@ import os
 
 class Config:
     # A Secret Key is required by Flask for session management and security
-    SECRET_KEY = os.environ.get('SECRET')
+    # 6d95ca25fe14a3615b1287f6201531b8666d3f232d1a86f213239d07e0fab152
+    SECRET_KEY = os.environ.get('FLASK_SECRET_KEY')
     
     # --- MongoDB Settings for Flask-MongoEngine ---
     MONGODB_SETTINGS = {
