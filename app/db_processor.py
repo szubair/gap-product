@@ -71,7 +71,6 @@ def update_asset_calculated_fields(asset_doc):
 def update_unknown_asset_fields(ip_address, hostname, va_count=1, scan_date=None):
     """
     Upserts a host into the UnknownAsset collection and updates its VA count and scan date.
-    This runs when a scan finding is found for an IP not in the main Asset table.
     """
     if scan_date is None:
         scan_date = datetime.utcnow()
@@ -166,7 +165,7 @@ def upload_asset_list(file_path):
 def upload_vulnerability_scan(file_path):
     """
     Parses scan report, links to assets, or stores as UnknownAsset if not found.
-    Handles duplicate scan records via NotUniqueError.
+    Uses an explicit check and NotUniqueError handling to prevent duplicates.
     """
     df = read_uploaded_file(file_path)
     inserted_count = 0
@@ -194,20 +193,27 @@ def upload_vulnerability_scan(file_path):
             asset_hostname = asset_hostname.strip()
 
             asset_doc = Asset.objects(private_ip=asset_ip).first()
+            
+            plugin_id_str = str(row[SCAN_COLUMNS['plugin_id']])
 
             if not asset_doc:
                 # --- ASSET IS UNKNOWN: Store it in the staging table ---
                 update_unknown_asset_fields(asset_ip, asset_hostname, scan_date=datetime.utcnow())
                 unknown_count += 1
                 continue
+            
+            # --- CRITICAL DUPLICATE CHECK: Explicitly check for existence before saving ---
+            if VulnerabilityScan.objects(asset=asset_doc, plugin_id=plugin_id_str).first():
+                duplicate_count += 1
+                continue
                 
-            # --- ASSET IS KNOWN: Insert the finding ---
+            # --- ASSET IS KNOWN & NOT DUPLICATE: Insert the finding ---
             cve_id = row[SCAN_COLUMNS['cve']] if pd.notna(row[SCAN_COLUMNS['cve']]) else None
             cvss_score = float(row[SCAN_COLUMNS['cvss_score']]) if pd.notna(row[SCAN_COLUMNS['cvss_score']]) else None
 
             scan_data = VulnerabilityScan(
                 asset=asset_doc, vulnerability_name=row[SCAN_COLUMNS['name']],
-                severity=row[SCAN_COLUMNS['risk']], plugin_id=str(row[SCAN_COLUMNS['plugin_id']]),
+                severity=row[SCAN_COLUMNS['risk']], plugin_id=plugin_id_str, # Use the string version
                 cve_id=cve_id, cvss_score=cvss_score, description=row[SCAN_COLUMNS['description']],
                 solution=row[SCAN_COLUMNS['solution']]
             )
@@ -219,7 +225,7 @@ def upload_vulnerability_scan(file_path):
                 # Update the parent Asset's calculated fields ONLY if insertion was successful
                 update_asset_calculated_fields(asset_doc) 
             except NotUniqueError:
-                # This record is a duplicate (same asset and plugin_id), so we skip it.
+                # This block handles the DB-level constraint, though the explicit check should prevent reaching here
                 duplicate_count += 1
                 continue
             
