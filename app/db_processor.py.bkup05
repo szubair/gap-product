@@ -185,32 +185,16 @@ def upload_vulnerability_scan(file_path):
 
 
     for index, row in df.iterrows():
-        asset_ip = ""
         try:
-            # --- Data Cleaning (CRITICAL FOR DUPLICATE CHECK) ---
-            # Strip all fields used in lookups or stored as strings to remove hidden whitespace
             asset_ip = str(row[SCAN_COLUMNS['host']]).strip()
+            # Attempt to pull hostname if it exists, otherwise use a placeholder
             asset_hostname_col = [col for col in df.columns if col.lower() == 'hostname']
-            asset_hostname = str(row[asset_hostname_col[0]]).strip() if asset_hostname_col and pd.notna(row[asset_hostname_col[0]]) else "Unknown Hostname"
-            
+            asset_hostname = str(row[asset_hostname_col[0]]) if asset_hostname_col else "Unknown Hostname"
+            asset_hostname = asset_hostname.strip()
+
             asset_doc = Asset.objects(private_ip=asset_ip).first()
             
-            plugin_id_str = str(row[SCAN_COLUMNS['plugin_id']]).strip()
-            
-            # Strip fields for consistent storage
-            vuln_name = str(row[SCAN_COLUMNS['name']]).strip()
-            vuln_severity = str(row[SCAN_COLUMNS['risk']]).strip()
-            vuln_description = str(row[SCAN_COLUMNS['description']]).strip()
-            vuln_solution = str(row[SCAN_COLUMNS['solution']]).strip()
-            
-            # Handle NaN/None for CVE and strip if present
-            vuln_cve = str(row[SCAN_COLUMNS['cve']]).strip() if pd.notna(row[SCAN_COLUMNS['cve']]) else None 
-            
-            # CVSS Score is numeric, no strip needed, but must handle NaN
-            cvss_score = float(row[SCAN_COLUMNS['cvss_score']]) if pd.notna(row[SCAN_COLUMNS['cvss_score']]) else None
-
-            # Diagnostic Log: What we are checking
-            print(f"DEBUG CHECKING: IP={asset_ip}, PluginID={plugin_id_str}, CVE={vuln_cve}")
+            plugin_id_str = str(row[SCAN_COLUMNS['plugin_id']])
 
             if not asset_doc:
                 # --- ASSET IS UNKNOWN: Store it in the staging table ---
@@ -218,21 +202,20 @@ def upload_vulnerability_scan(file_path):
                 unknown_count += 1
                 continue
             
-            # --- CRITICAL DUPLICATE CHECK (Asset + Plugin ID) ---
-            # We use Plugin ID as the technical fingerprint for the finding.
-            existing_scan = VulnerabilityScan.objects(asset=asset_doc, plugin_id=plugin_id_str).first()
-            
-            if existing_scan:
-                print(f"DEBUG SKIPPED: Duplicate found for IP={asset_ip}, PluginID={plugin_id_str}")
+            # --- CRITICAL DUPLICATE CHECK: Explicitly check for existence before saving ---
+            if VulnerabilityScan.objects(asset=asset_doc, plugin_id=plugin_id_str).first():
                 duplicate_count += 1
                 continue
                 
             # --- ASSET IS KNOWN & NOT DUPLICATE: Insert the finding ---
+            cve_id = row[SCAN_COLUMNS['cve']] if pd.notna(row[SCAN_COLUMNS['cve']]) else None
+            cvss_score = float(row[SCAN_COLUMNS['cvss_score']]) if pd.notna(row[SCAN_COLUMNS['cvss_score']]) else None
+
             scan_data = VulnerabilityScan(
-                asset=asset_doc, vulnerability_name=vuln_name,
-                severity=vuln_severity, plugin_id=plugin_id_str,
-                cve_id=vuln_cve, cvss_score=cvss_score, 
-                description=vuln_description, solution=vuln_solution
+                asset=asset_doc, vulnerability_name=row[SCAN_COLUMNS['name']],
+                severity=row[SCAN_COLUMNS['risk']], plugin_id=plugin_id_str, # Use the string version
+                cve_id=cve_id, cvss_score=cvss_score, description=row[SCAN_COLUMNS['description']],
+                solution=row[SCAN_COLUMNS['solution']]
             )
             
             try:
@@ -243,7 +226,6 @@ def upload_vulnerability_scan(file_path):
                 update_asset_calculated_fields(asset_doc) 
             except NotUniqueError:
                 # This block handles the DB-level constraint, though the explicit check should prevent reaching here
-                print(f"DEBUG DB-ERROR: NotUniqueError hit for IP={asset_ip}, PluginID={plugin_id_str}")
                 duplicate_count += 1
                 continue
             
