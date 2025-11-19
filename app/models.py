@@ -66,8 +66,6 @@ class VulnerabilityScan(Document):
 
     # Metadata
     scan_date = DateTimeField(default=datetime.utcnow)
-    # CRITICAL NEW FIELD: Tracks the last time this specific finding appeared in a scan report
-    last_found = DateTimeField(required=True, default=datetime.utcnow) 
     
     meta = {
         'collection': 'vulnerability_scans',
@@ -89,8 +87,8 @@ class RemediationRecord(Document):
 
     # Remediation Details
     remediation_date = DateTimeField(default=datetime.utcnow)
-    action_taken = StringField(default='Absence Verified in Scan') # Updated default for Clearance Logic
-    verified_status = StringField(default='Verified by Scan') 
+    action_taken = StringField(default='') # e.g., Patched, Decommissioned, Mitigated
+    verified_status = StringField(default='Verified') # e.g., Verified, Pending Re-scan
 
     meta = {
         'collection': 'remediation_records',
@@ -108,8 +106,8 @@ class UnknownAsset(Document):
     private_ip = StringField(required=True, unique=True)
     hostname = StringField(default='Unknown Hostname')
     
-    # Calculated fields based on UnknownVulnerabilityScan
-    va_count = IntField(default=0) 
+    # Calculated fields based on UnknownVulnerabilityScan (new logic)
+    va_count = IntField(default=0) # Must be calculated from the new finding collection
     last_scan_date = DateTimeField(default=datetime.utcnow)
     
     # Metadata
@@ -122,7 +120,7 @@ class UnknownAsset(Document):
         ]
     }
 
-# --- 5. UnknownVulnerabilityScan Model (The Finding Staging Area) ---
+# --- 5. NEW: UnknownVulnerabilityScan Model (The Finding Staging Area) ---
 
 class UnknownVulnerabilityScan(Document):
     """
@@ -130,10 +128,13 @@ class UnknownVulnerabilityScan(Document):
     This is necessary to maintain a correct 'va_count' for UnknownAsset.
     """
     
+    # Link to the Unknown Asset (via IP, since it's the unique key)
     private_ip = StringField(required=True)
+    
+    # Unique Identifier for the vulnerability type
     plugin_id = StringField(required=True) 
     
-    # Finding Details (Minimal set for staging)
+    # Finding Details (Optional, but good for context if the host is promoted later)
     vulnerability_name = StringField(required=True)
     severity = StringField(required=True)
 
