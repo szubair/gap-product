@@ -1,7 +1,7 @@
 from datetime import datetime
 import pandas as pd
 from mongoengine.errors import NotUniqueError
-from app.models import Asset, VulnerabilityScan, RemediationRecord, UnknownAsset, UnknownVulnerabilityScan # Import all models
+from app.models import Asset, VulnerabilityScan, RemediationRecord, UnknownAsset, UnknownVulnerabilityScan
 
 # --- Helper Function for VA Count Calculation ---
 def update_asset_calculated_fields(asset_doc: Asset):
@@ -26,9 +26,9 @@ def update_asset_calculated_fields(asset_doc: Asset):
     # DEBUG VA COUNT: Check the number calculated
     print(f"DEBUG VA COUNT for IP {asset_doc.private_ip}: {va_count} open findings.")
 
-    # 4. Determine Last Scan Date
-    last_scan = VulnerabilityScan.objects(asset=asset_doc).order_by('-scan_date').first()
-    last_scan_date = last_scan.scan_date if last_scan else None
+    # 4. Determine Last Scan Date (based on the last time any finding was recorded)
+    last_scan = VulnerabilityScan.objects(asset=asset_doc).order_by('-last_found').first()
+    last_scan_date = last_scan.last_found if last_scan else None
 
     # 5. Determine Last Remediated Date
     last_remediation = RemediationRecord.objects(scan__in=VulnerabilityScan.objects(asset=asset_doc)).order_by('-remediation_date').first()
@@ -42,7 +42,51 @@ def update_asset_calculated_fields(asset_doc: Asset):
         set__last_updated=datetime.utcnow()
     )
 
-# --- NEW HELPER: Migrate Findings on Promotion ---
+# --- NEW HELPER: Remediation by Absence Logic (Clearance Scan) ---
+def process_clearance_scan(current_scan_date: datetime, processed_asset_ids: set):
+    """
+    Checks all previously found vulnerabilities for known assets.
+    If a finding's last_found date is OLDER than the current scan_date,
+    it means the finding was NOT in the latest report and is now considered remediated.
+    """
+    remediated_count = 0
+    
+    # 1. Find all open findings that were NOT updated in the current scan batch.
+    # We filter by assets that were processed in the current batch for efficiency.
+    findings_to_check = VulnerabilityScan.objects(
+        asset__in=list(processed_asset_ids), # Only check assets present in the current report
+        last_found__lt=current_scan_date # Finding was last seen BEFORE the current scan started
+    )
+    
+    for finding in findings_to_check:
+        # Check if a RemediationRecord already exists (to prevent duplicates)
+        if RemediationRecord.objects(scan=finding).count() == 0:
+            try:
+                # Create the RemediationRecord, linking it to the finding
+                RemediationRecord(
+                    scan=finding,
+                    remediation_date=current_scan_date, # Remediation date is the clearance scan date
+                    action_taken='Absence Verified in Scan',
+                    verified_status='Verified by Scan'
+                ).save()
+                
+                remediated_count += 1
+                
+                # Update the asset's calculated fields immediately
+                asset_doc = finding.asset.fetch()
+                update_asset_calculated_fields(asset_doc)
+                
+            except NotUniqueError:
+                # Remediation record already exists
+                pass 
+            except Exception as e:
+                print(f"ERROR creating remediation record: {e}")
+                
+    print(f"DEBUG CLEARANCE SCAN: {remediated_count} vulnerabilities marked as remediated by absence.")
+    return remediated_count
+
+
+# --- HELPER: Migrate Findings on Promotion ---
 def migrate_unknown_findings_to_asset(asset_doc: Asset):
     """
     MIGRATION FIX: Moves findings from UnknownVulnerabilityScan to VulnerabilityScan 
@@ -62,12 +106,10 @@ def migrate_unknown_findings_to_asset(asset_doc: Asset):
                 plugin_id=uf.plugin_id,
                 vulnerability_name=uf.vulnerability_name,
                 severity=uf.severity,
-                scan_date=uf.scan_date
-                # Note: cve_id, cvss_score, description, solution are not in the UnknownVulnerabilityScan model
+                scan_date=uf.scan_date,
+                last_found=uf.scan_date # Set last_found on creation
             ).save()
         except NotUniqueError:
-            # This should not happen if the UnknownVulnerabilityScan was unique, 
-            # but we catch it just in case of race conditions.
             print(f"DEBUG: Skipped duplicate finding during migration for IP {ip_address}, Plugin {uf.plugin_id}")
             pass
         except Exception as e:
@@ -142,7 +184,7 @@ def upload_asset_list(file_path):
                     # 2. Update the VA count immediately after migration
                     update_asset_calculated_fields(asset_doc)
                     
-                    promoted_ips.append(asset_ip) # Track for final cleanup if needed
+                    promoted_ips.append(asset_ip)
                     
         return f"Asset list upload complete. Inserted: {inserted_count}, Updated: {updated_count}. Promoted/Processed: {len(promoted_ips)} hosts."
 
@@ -153,15 +195,16 @@ def upload_asset_list(file_path):
 def upload_vulnerability_scan(file_path):
     """
     Uploads vulnerability scan data. Links findings to Assets or stages them as UnknownAssets.
+    Includes logic for setting last_found and triggering the clearance scan.
     """
     try:
         df = pd.read_excel(file_path).fillna('')
         inserted_count = 0
-        updated_count = 0
         duplicate_count = 0
         unknown_count = 0
+        found_known_assets = set() # To track which assets were in this report
         
-        # Set scan date once for the entire batch
+        # Set scan date once for the entire batch (used as the clearance timestamp)
         scan_date = datetime.utcnow()
 
         for index, row in df.iterrows():
@@ -173,9 +216,7 @@ def upload_vulnerability_scan(file_path):
                 continue
 
             # --- ULTRA-ROBUST CLEANING AND DATA CONVERSION ---
-            # Ensure IP is a clean string
             asset_ip = str(asset_ip_raw).strip()
-            # Ensure Plugin ID is a consistent integer string (handling 90001 vs 90001.0)
             if isinstance(plugin_id_raw, (int, float)):
                 plugin_id_str = str(int(plugin_id_raw))
             else:
@@ -191,24 +232,18 @@ def upload_vulnerability_scan(file_path):
                 # 1. Ensure the UnknownHost itself exists/is updated
                 unknown_host_doc = UnknownAsset.objects(private_ip=asset_ip).first()
                 if not unknown_host_doc:
-                    # Insert new unknown host placeholder
                     UnknownAsset(
                         private_ip=asset_ip,
                         hostname=asset_hostname,
-                        va_count=0, # Count is calculated from UnknownVulnerabilityScan
+                        va_count=0,
                         last_scan_date=scan_date
                     ).save()
-                    unknown_host_doc = UnknownAsset.objects(private_ip=asset_ip).first() # Fetch for ID/Ref
-                    
+                    unknown_host_doc = UnknownAsset.objects(private_ip=asset_ip).first()
                 else:
-                    # Host exists, update scan date
-                    unknown_host_doc.update(
-                        set__last_scan_date=scan_date
-                    )
+                    unknown_host_doc.update(set__last_scan_date=scan_date)
                 
                 # 2. Insert/Upsert the finding into the UnknownVulnerabilityScan staging table
                 try:
-                    # We only need the key fields to maintain a count
                     UnknownVulnerabilityScan(
                         private_ip=asset_ip,
                         plugin_id=plugin_id_str,
@@ -218,13 +253,11 @@ def upload_vulnerability_scan(file_path):
                     ).save()
                     
                     # 3. Recalculate VA count for the UnknownAsset host placeholder
-                    # Count distinct plugin IDs in the staging table for this IP
                     new_va_count = UnknownVulnerabilityScan.objects(private_ip=asset_ip).distinct('plugin_id').count()
                     unknown_host_doc.update(set__va_count=new_va_count)
                     
                     unknown_count += 1
                 except NotUniqueError:
-                    # Finding already exists in staging table, silently skip
                     duplicate_count += 1
                 except Exception as e:
                     print(f"DEBUG DB-ERROR on row {index} (Unknown Host): {e}")
@@ -232,16 +265,17 @@ def upload_vulnerability_scan(file_path):
                 continue # Move to next row
                 
             # --- HOST IS KNOWN (Main VulnerabilityScan Logic) ---
-            
-            # Get other fields
+            found_known_assets.add(asset_doc.id)
             vulnerability_name = str(row['vulnerability_name']).strip()
             severity = str(row['severity']).strip()
             
-            # CRITICAL DUPLICATE CHECK: Explicitly check for existence before saving
-            print(f"DEBUG CHECKING: IP={asset_ip}, Plugin={plugin_id_str}")
-            if VulnerabilityScan.objects(asset=asset_doc, plugin_id=plugin_id_str).first():
+            # CRITICAL DUPLICATE CHECK: Explicitly check for existence before saving/updating
+            existing_scan = VulnerabilityScan.objects(asset=asset_doc, plugin_id=plugin_id_str).first()
+            
+            if existing_scan:
+                # Update existing finding to reflect it was found in this scan
+                existing_scan.update(set__last_found=scan_date)
                 duplicate_count += 1
-                print(f"DEBUG SKIPPED: Duplicate found for IP={asset_ip}, Plugin={plugin_id_str}")
                 continue
 
             # Attempt to insert the unique finding
@@ -255,7 +289,8 @@ def upload_vulnerability_scan(file_path):
                     cvss_score=row['cvss_score'],
                     description=row['description'],
                     solution=row['solution'],
-                    scan_date=scan_date
+                    scan_date=scan_date,
+                    last_found=scan_date # Set last_found on creation
                 ).save()
                 inserted_count += 1
                 
@@ -263,23 +298,24 @@ def upload_vulnerability_scan(file_path):
                 update_asset_calculated_fields(asset_doc)
 
             except NotUniqueError:
-                # Fallback check: If the explicit check failed (e.g., race condition), MongoDB catches it
                 duplicate_count += 1
-                print(f"DEBUG DB-ERROR on row {index}: NotUniqueError caught (fallback).")
             except Exception as e:
                 print(f"An error occurred on row {index}: {e}")
 
-        return f"Vulnerability scan upload complete. Known Findings Inserted: {inserted_count}, Unknown Findings Staged: {unknown_count}, Duplicates Skipped: {duplicate_count}."
+        # --- POST-PROCESSING: RUN CLEARANCE SCAN ---
+        remediated_count = process_clearance_scan(scan_date, found_known_assets)
+
+        return f"Vulnerability scan upload complete. Known Findings Inserted: {inserted_count}, Unknown Findings Staged: {unknown_count}, Duplicates Skipped: {duplicate_count}. Remediated by Absence: {remediated_count}."
 
     except Exception as e:
         return f"An error occurred during scan upload: {e}"
 
 
-# --- NEW: Function to get all known assets for display ---
+# --- Utility Functions ---
+
 def get_asset_list_for_display():
     """Fetches all known assets for the main inventory display."""
     try:
-        # Fetch assets, sorted by private_ip for consistency
         assets = Asset.objects().order_by('private_ip')
         
         return [{
@@ -307,9 +343,6 @@ def get_unknown_hosts_for_display():
     try:
         hosts = UnknownAsset.objects().order_by('-last_scan_date')
         
-        # We don't need to manually calculate the VA count here as it's updated 
-        # when the UnknownVulnerabilityScan collection is populated.
-
         return [{
             'private_ip': h.private_ip,
             'hostname': h.hostname,
