@@ -37,6 +37,7 @@ def update_asset_calculated_fields(asset_doc):
     
     # 1. Calculate VA Count (Total UNREMEDIATED findings)
     # Get the IDs of all scan findings that have a remediation record
+    # Note: This nested query works with MongoEngine but could be optimized for large datasets
     remediated_scan_ids = RemediationRecord.objects(
         scan__in=VulnerabilityScan.objects(asset=asset_doc)
     ).distinct('scan')
@@ -187,8 +188,14 @@ def upload_vulnerability_scan(file_path):
             asset_ip = str(row[SCAN_COLUMNS['host']]).strip()
             if not asset_ip: continue
             
+            # Find hostname column (case-insensitive search)
             asset_hostname_col = [col for col in df.columns if col.lower() == 'hostname']
-            asset_hostname = str(row[asset_hostname_col[0]]).strip() if asset_hostname_col and pd.notna(row[asset_hostname_col[0]]) else "Unknown Hostname"
+            # Defensive fix: Properly check if column exists and has valid data before accessing
+            if asset_hostname_col and len(asset_hostname_col) > 0:
+                hostname_value = row[asset_hostname_col[0]]
+                asset_hostname = str(hostname_value).strip() if pd.notna(hostname_value) else "Unknown Hostname"
+            else:
+                asset_hostname = "Unknown Hostname"
             
             asset_doc = Asset.objects(private_ip=asset_ip).first()
             
