@@ -61,6 +61,13 @@ def upload_assets():
             except Exception as e:
                 flash(f'Error processing asset file: {e}', 'danger')
                 return redirect(request.url)
+            finally:
+                # Clean up uploaded file to prevent disk space issues
+                if os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                    except OSError as e:
+                        print(f"Warning: Could not delete uploaded file {file_path}: {e}")
 
     # GET request renders the upload form
     return render_template('upload_form.html', upload_type='Asset List')
@@ -93,5 +100,12 @@ def upload_scans():
             except Exception as e:
                 flash(f'Error processing scan file: {e}', 'danger')
                 return redirect(request.url)
+            finally:
+                # Clean up uploaded file to prevent disk space issues
+                if os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                    except OSError as e:
+                        print(f"Warning: Could not delete uploaded file {file_path}: {e}")
 
     return render_template('upload_form.html', upload_type='Vulnerability Scan Report')
