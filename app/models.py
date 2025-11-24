@@ -1,150 +1,78 @@
+from flask_mongoengine import MongoEngine
+# CRITICAL FIX: Only import classes defined in the mongoengine library.
+from mongoengine import Document, StringField, IntField, FloatField, DateTimeField, ReferenceField
 from datetime import datetime
-from mongoengine import Document, ReferenceField, StringField, IntField, FloatField, DateTimeField, ListField
 
-# --- 1. Asset Model (The main inventory) ---
+db = MongoEngine()
 
+# --- MODEL 1: Asset Inventory ---
 class Asset(Document):
     """
-    Represents an inventory asset (server, device, etc.). 
-    This is the central entity for tracking security posture.
+    Main asset inventory document, stores core information and calculated metrics.
     """
-    
-    # Required Fields
-    private_ip = StringField(required=True, unique=True)
     hostname = StringField(required=True)
-    
-    # Static Inventory Fields
-    description = StringField(default='')
-    status = StringField(default='Active')
-    role = StringField(default='')
-    env = StringField(default='')
-    location = StringField(default='')
-    platform = StringField(default='')
-    
-    # Ownership Fields
-    infra_owner = StringField(default='N/A')
-    app_owner = StringField(default='N/A')
-    vendor_availability = StringField(default='N/A')
+    private_ip = StringField(required=True, unique=True)
+    description = StringField(default=None)
+    status = StringField(default="Active") # Active, Decommissioned, etc.
+    role = StringField(default=None) # e.g., Frontend, Database, Firewall
+    env = StringField(default=None) # e.g., Production, Staging, Dev
+    location = StringField(default=None)
+    platform = StringField(default=None)
+    infra_owner = StringField(default=None) # Infrastructure owner team
+    app_owner = StringField(default=None) # Application owner team
+    vendor_availability = StringField(default=None) # e.g., 99.99%
 
-    # Calculated Fields (Updated by db_processor.py)
+    # Calculated fields (updated by db_processor.py)
     va_count = IntField(default=0)
     last_scan_date = DateTimeField(default=None)
     last_remediated_date = DateTimeField(default=None)
-    
-    # Metadata
-    last_updated = DateTimeField(default=datetime.utcnow)
-    feedback = StringField(default='') # For analyst notes
+    last_updated = DateTimeField(default=datetime.utcnow) # When the document itself was last modified
+    feedback = StringField(default=None) # For manual notes or overrides
 
-    meta = {
-        'collection': 'assets',
-        'indexes': [
-            'private_ip',
-            'hostname'
-        ]
-    }
+    meta = {'collection': 'assets'}
 
-# --- 2. VulnerabilityScan Model (The Finding) ---
-
+# --- MODEL 2: Vulnerability Scan Findings ---
 class VulnerabilityScan(Document):
     """
-    Represents a single vulnerability finding on a specific asset from a scan report.
+    Stores individual vulnerability findings linked to a specific Asset.
     """
-    
-    # Link to the Asset
-    asset = ReferenceField(Asset, required=True)
-    
-    # Unique Identifier for the vulnerability type
-    plugin_id = StringField(required=True) 
-
-    # Finding Details
+    asset = ReferenceField(Asset, required=True, reverse_delete_rule=2) # Cascade delete if Asset is removed
     vulnerability_name = StringField(required=True)
     severity = StringField(required=True) # e.g., Critical, High, Medium, Low
-    cve_id = StringField(default=None) # Can be None/Blank
+    plugin_id = StringField(required=True)
+    cve_id = StringField(default=None)
     cvss_score = FloatField(default=0.0)
-    description = StringField(default='')
-    solution = StringField(default='')
-
-    # Metadata
-    scan_date = DateTimeField(default=datetime.utcnow)
+    description = StringField(default=None)
+    solution = StringField(default=None)
     
-    meta = {
-        'collection': 'vulnerability_scans',
-        # CRITICAL FIX: Ensures only one finding per asset and plugin ID exists.
-        'indexes': [
-            {'fields': ('asset', 'plugin_id'), 'unique': True}
-        ]
-    }
+    # Store the date of the scan event itself
+    scan_date = DateTimeField(default=datetime.utcnow) 
 
-# --- 3. RemediationRecord Model (The Fix) ---
+    meta = {'collection': 'vulnerability_scans'}
 
+# --- MODEL 3: Remediation Records ---
 class RemediationRecord(Document):
     """
-    Tracks when a specific vulnerability finding was resolved/remediated.
+    Records a completed remediation action for a specific VulnerabilityScan finding.
     """
-    
-    # Link to the specific finding that was fixed
-    scan = ReferenceField(VulnerabilityScan, required=True, unique=True) # Ensure only one remediation per scan
-
-    # Remediation Details
+    scan = ReferenceField(VulnerabilityScan, required=True, unique=True, reverse_delete_rule=2) 
+    action_taken = StringField(required=True) # e.g., Patch Applied, Configuration Change, Mitigation
     remediation_date = DateTimeField(default=datetime.utcnow)
-    action_taken = StringField(default='') # e.g., Patched, Decommissioned, Mitigated
-    verified_status = StringField(default='Verified') # e.g., Verified, Pending Re-scan
+    verified_status = StringField(required=True) # e.g., Verified, Accepted Risk, False Positive
 
-    meta = {
-        'collection': 'remediation_records',
-        'indexes': [
-            'scan'
-        ]
-    }
+    meta = {'collection': 'remediation_records'}
     
-# --- 4. UnknownAsset Model (The Host Staging Area) ---
-
+# --- MODEL 4: UNKNOWN HOSTS (The new required model) ---
 class UnknownAsset(Document):
     """
-    Temporary collection for assets found in scans but not in the main Asset inventory.
+    Temporary staging area for assets found in scan reports but not in the main asset inventory.
     """
     private_ip = StringField(required=True, unique=True)
-    hostname = StringField(default='Unknown Hostname')
+    hostname = StringField(default="Unknown Hostname")
     
-    # Calculated fields based on UnknownVulnerabilityScan (new logic)
-    va_count = IntField(default=0) # Must be calculated from the new finding collection
+    # Calculated fields for immediate reporting
+    va_count = IntField(default=0)
     last_scan_date = DateTimeField(default=datetime.utcnow)
-    
-    # Metadata
-    feedback = StringField(default='') # For analyst notes
+    feedback = StringField(default=None) 
 
-    meta = {
-        'collection': 'unknown_assets',
-        'indexes': [
-            'private_ip'
-        ]
-    }
-
-# --- 5. NEW: UnknownVulnerabilityScan Model (The Finding Staging Area) ---
-
-class UnknownVulnerabilityScan(Document):
-    """
-    Tracks unique vulnerability findings on assets not yet in the main inventory.
-    This is necessary to maintain a correct 'va_count' for UnknownAsset.
-    """
-    
-    # Link to the Unknown Asset (via IP, since it's the unique key)
-    private_ip = StringField(required=True)
-    
-    # Unique Identifier for the vulnerability type
-    plugin_id = StringField(required=True) 
-    
-    # Finding Details (Optional, but good for context if the host is promoted later)
-    vulnerability_name = StringField(required=True)
-    severity = StringField(required=True)
-
-    # Metadata
-    scan_date = DateTimeField(default=datetime.utcnow)
-
-    meta = {
-        'collection': 'unknown_vulnerability_scans',
-        # CRITICAL: Unique constraint on IP + Plugin ID for unknown findings
-        'indexes': [
-            {'fields': ('private_ip', 'plugin_id'), 'unique': True}
-        ]
-    }
+    meta = {'collection': 'unknown_assets'}
