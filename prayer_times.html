@@ -51,6 +51,12 @@
             font-weight: 500;
         }
 
+        .date-item {
+            display: block; /* Ensures each date is on its own line */
+            margin-top: 5px;
+            font-weight: bold;
+        }
+
         table {
             width: 100%;
             border-collapse: collapse;
@@ -89,8 +95,8 @@
         <h1>🕌 Riyadh Prayer Times</h1>
         <p class="date" id="date-location">
             Timezone: **Riyadh, Saudi Arabia**
-            <br>
-            Date: <span id="hijri-date">Loading...</span>
+            <span class="date-item" id="gregorian-date">Date: Loading Gregorian...</span>
+            <span class="date-item" id="hijri-date">Date: Loading Hijri...</span>
         </p>
         
         <div id="loading-spinner" class="loading">
@@ -139,7 +145,6 @@
         };
 
         async function fetchPrayerTimes() {
-            const container = document.getElementById('prayer-container');
             const loadingSpinner = document.getElementById('loading-spinner');
             const prayerTable = document.getElementById('prayer-table');
             
@@ -155,6 +160,8 @@
                 }
 
                 const timings = data.data.timings;
+                // Extracting both Gregorian and Hijri dates from the API response
+                const gregorianDate = data.data.date.readable; 
                 const hijriDate = data.data.date.hijri.date;
 
                 // 1. Update the dates and times
@@ -163,8 +170,9 @@
                     document.getElementById(elementId).textContent = timings[prayer];
                 }
 
-                // 2. Update the Hijri Date
-                document.getElementById('hijri-date').textContent = hijriDate;
+                // 2. Update both Gregorian and Hijri Dates
+                document.getElementById('gregorian-date').textContent = `Gregorian: ${gregorianDate}`;
+                document.getElementById('hijri-date').textContent = `Hijri: ${hijriDate}`;
                 
                 // 3. Hide loading and show table
                 loadingSpinner.style.display = 'none';
