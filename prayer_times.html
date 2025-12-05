@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dynamic Riyadh Prayer Times</title>
+    <style>
+        /* --- CSS for Simple, Lean UI --- */
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f0f4f8; /* Light background */
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            color: #333;
+        }
+
+        .container {
+            background-color: #ffffff; /* White card */
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+            max-width: 420px;
+            width: 90%;
+            text-align: center;
+            transition: transform 0.3s ease;
+        }
+        
+        /* Loading State Styling */
+        .loading {
+            min-height: 250px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-style: italic;
+            color: #999;
+        }
+
+        h1 {
+            color: #1e88e5; /* Primary blue for title */
+            margin-bottom: 5px;
+            font-size: 1.8em;
+        }
+
+        p.date {
+            color: #666;
+            margin-bottom: 25px;
+            font-size: 1.1em;
+            font-weight: 500;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+
+        th, td {
+            padding: 15px;
+            text-align: left;
+            border-bottom: 1px solid #eee;
+        }
+
+        th {
+            background-color: #f8f9fa; /* Light grey header */
+            color: #1e88e5;
+            font-weight: 600;
+            font-size: 1.1em;
+        }
+        
+        /* Highlight the prayer time (td) */
+        td:last-child {
+            font-weight: bold;
+            color: #388e3c; /* Green for time */
+            text-align: right;
+            font-family: 'Roboto Mono', monospace;
+            font-size: 1.3em;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container" id="prayer-container">
+        <h1>🕌 Riyadh Prayer Times</h1>
+        <p class="date" id="date-location">
+            Timezone: **Riyadh, Saudi Arabia**
+            <br>
+            Date: <span id="hijri-date">Loading...</span>
+        </p>
+        
+        <div id="loading-spinner" class="loading">
+            Fetching prayer times...
+        </div>
+
+        <table id="prayer-table" style="display:none;">
+            <thead>
+                <tr>
+                    <th>Prayer</th>
+                    <th>Time</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr><td>Fajr (الفجر)</td><td id="time-Fajr">--:--</td></tr>
+                <tr><td>Sunrise (الشروق)</td><td id="time-Sunrise">--:--</td></tr>
+                <tr><td>Dhuhr (الظهر)</td><td id="time-Dhuhr">--:--</td></tr>
+                <tr><td>Asr (العصر)</td><td id="time-Asr">--:--</td></tr>
+                <tr><td>Maghrib (المغرب)</td><td id="time-Maghrib">--:--</td></tr>
+                <tr><td>Isha (العشاء)</td><td id="time-Isha">--:--</td></tr>
+            </tbody>
+        </table>
+
+        <p style="margin-top: 30px; font-size: 0.9em; color: #aaa;">
+            *Times are based on the Umm Al-Qura calculation method for Riyadh.
+        </p>
+    </div>
+
+    <script>
+        const API_URL = 'https://api.aladhan.com/v1/timingsByCity';
+        
+        // Settings for Riyadh, KSA. Method 1 (Umm Al-Qura) is appropriate for Saudi Arabia.
+        const PARAMS = new URLSearchParams({
+            city: 'Riyadh',
+            country: 'Saudi Arabia',
+            method: 1
+        });
+
+        const PRAYER_MAP = {
+            'Fajr': 'time-Fajr',
+            'Sunrise': 'time-Sunrise',
+            'Dhuhr': 'time-Dhuhr',
+            'Asr': 'time-Asr',
+            'Maghrib': 'time-Maghrib',
+            'Isha': 'time-Isha'
+        };
+
+        async function fetchPrayerTimes() {
+            const container = document.getElementById('prayer-container');
+            const loadingSpinner = document.getElementById('loading-spinner');
+            const prayerTable = document.getElementById('prayer-table');
+            
+            try {
+                const response = await fetch(`${API_URL}?${PARAMS.toString()}`);
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                const data = await response.json();
+
+                if (data.status !== 'OK') {
+                    throw new Error(`API error: ${data.message || 'Unknown error'}`);
+                }
+
+                const timings = data.data.timings;
+                const hijriDate = data.data.date.hijri.date;
+
+                // 1. Update the dates and times
+                for (const prayer in PRAYER_MAP) {
+                    const elementId = PRAYER_MAP[prayer];
+                    document.getElementById(elementId).textContent = timings[prayer];
+                }
+
+                // 2. Update the Hijri Date
+                document.getElementById('hijri-date').textContent = hijriDate;
+                
+                // 3. Hide loading and show table
+                loadingSpinner.style.display = 'none';
+                prayerTable.style.display = 'table';
+                
+            } catch (error) {
+                console.error("Could not fetch prayer times:", error);
+                
+                // Display error message to the user
+                loadingSpinner.innerHTML = `
+                    <span style="color: red;">
+                        Failed to load times. Please check your internet connection.<br>
+                        (${error.message})
+                    </span>
+                `;
+                // Keep the table hidden
+                prayerTable.style.display = 'none';
+            }
+        }
+
+        // Execute the function when the page loads
+        document.addEventListener('DOMContentLoaded', fetchPrayerTimes);
+    </script>
+</body>
+</html>
